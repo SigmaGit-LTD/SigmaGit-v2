@@ -6,7 +6,6 @@ import { parseLimit, parseOffset } from "../lib/validation";
 
 const app = new Hono<{ Variables: AuthVariables }>();
 
-app.use("*", authMiddleware);
 
 /** Resolve username to either a user or organization in one request. Prefers organization when both exist. */
 app.get("/api/users/:username/resolve", async (c) => {

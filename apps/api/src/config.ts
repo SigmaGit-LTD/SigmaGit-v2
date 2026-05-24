@@ -9,14 +9,31 @@ const baseOrigins = [
   'exp://192.168.*.*:8081',
 ];
 
+function envInt(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (!raw) return fallback;
+  const parsed = parseInt(raw, 10);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function isProductionEnv(): boolean {
+  return (
+    process.env.NODE_ENV === 'production' ||
+    process.env.RAILWAY_ENVIRONMENT_NAME === 'production'
+  );
+}
+
 export const config = {
   port: parseInt(process.env.PORT || '3001', 10),
   databaseUrl: process.env.DATABASE_URL!,
   redisUrl: process.env.REDIS_URL,
   webhooksEnabled: process.env.ENABLE_WEBHOOKS !== 'false',
-  discordWebhookSecret: process.env.DISCORD_WEBHOOK_SECRET || null,
+  discordWebhookSecret: process.env.DISCORD_WEBHOOK_SECRET || process.env.WEBHOOK_SECRET || null,
   enableMigrations: process.env.ENABLE_MIGRATIONS !== 'false',
   migrationCredentialsKey: process.env.MIGRATION_CREDENTIALS_KEY || null,
+  runnerRegistrationSecret: process.env.RUNNER_REGISTRATION_SECRET || null,
+  trustProxy: process.env.TRUST_PROXY === 'true',
+  isProduction: isProductionEnv(),
   storage: {
     type: (process.env.STORAGE_TYPE as 's3' | 'local') || 's3',
     localPath: process.env.STORAGE_LOCAL_PATH || './data/repos',
@@ -25,14 +42,25 @@ export const config = {
       region: process.env.S3_REGION || 'auto',
       accessKeyId: process.env.S3_ACCESS_KEY_ID!,
       secretAccessKey: process.env.S3_SECRET_ACCESS_KEY!,
-      bucket: process.env.S3_BUCKET!,
+      bucket: process.env.S3_BUCKET || process.env.S3_BUCKET_NAME!,
     },
   },
   betterAuthSecret: process.env.BETTER_AUTH_SECRET!,
-  nodeEnv: process.env.RAILWAY_ENVIRONMENT_NAME || 'development',
-  apiUrl: process.env.RAILWAY_PUBLIC_DOMAIN || 'localhost:3001',
+  nodeEnv: process.env.NODE_ENV || process.env.RAILWAY_ENVIRONMENT_NAME || 'development',
+  apiUrl: process.env.API_URL || process.env.RAILWAY_PUBLIC_DOMAIN || 'localhost:3001',
   webUrl: process.env.WEB_URL || 'localhost:3000',
   expoPublicApiUrl: process.env.EXPO_PUBLIC_API_URL!,
+  rateLimit: {
+    general: envInt('RATE_LIMIT_GENERAL', 500),
+    auth: envInt('RATE_LIMIT_AUTH', 5),
+    write: envInt('RATE_LIMIT_WRITE', 30),
+    search: envInt('RATE_LIMIT_SEARCH', 60),
+    unauth: envInt('RATE_LIMIT_UNAUTH', 120),
+    apiKey: envInt('RATE_LIMIT_API_KEY', 200),
+    publicWrite: envInt('RATE_LIMIT_PUBLIC_WRITE', 10),
+  },
+  maxConcurrentRest: envInt('MAX_CONCURRENT_REQUESTS', 50),
+  maxConcurrentGit: envInt('MAX_CONCURRENT_GIT', 15),
   email: {
     provider: (process.env.EMAIL_PROVIDER as 'resend' | 'smtp') || 'resend',
     resendApiKey: process.env.RESEND_API_KEY,
@@ -59,7 +87,7 @@ export const getApiUrl = (): string => {
     return normalizeUrl(config.apiUrl);
   }
 
-  if (config.nodeEnv === 'production') {
+  if (config.isProduction) {
     throw new Error('API_URL must be set in production');
   }
 
@@ -71,7 +99,7 @@ export const getWebUrl = (): string => {
     return normalizeUrl(config.webUrl);
   }
 
-  if (config.nodeEnv === 'production') {
+  if (config.isProduction) {
     throw new Error('WEB_URL must be set in production');
   }
 

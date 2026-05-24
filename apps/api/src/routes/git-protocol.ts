@@ -1,8 +1,9 @@
 import { Hono } from "hono";
-import { db, users, repositories, repositoryCollaborators } from "@sigmagit/db";
+import { db, users, repositoryCollaborators } from "@sigmagit/db";
 import { eq, and } from "drizzle-orm";
-import { authMiddleware, type AuthUser, type AuthVariables } from "../middleware/auth";
-import { createGitStore, getRefsAdvertisement, repoCache } from "../git";
+import { type AuthUser, type AuthVariables } from "../middleware/auth";
+import { getRefsAdvertisement, repoCache } from "../git";
+import { resolveRepositoryBySlug, createRepoGitStore } from "../lib/repo-helpers";
 import git from "isomorphic-git";
 import { getAuth } from "../auth";
 import { putObject, deleteObject, getObject } from "../s3";
@@ -13,8 +14,6 @@ import { triggerWorkflows } from "../workflows/trigger";
 import { syncWorkflows } from "../workflows/sync";
 
 const app = new Hono<{ Variables: AuthVariables }>();
-
-app.use("*", authMiddleware);
 
 async function resolveBasicAuthUser(authHeader: string | undefined): Promise<AuthUser | null> {
   if (!authHeader || !authHeader.startsWith("Basic ")) {
@@ -136,41 +135,7 @@ async function resolveGitUser(c: { get: (key: string) => AuthUser | undefined; r
   return await resolveBasicAuthUser(c.req.header("authorization"));
 }
 
-async function getRepoAndStore(owner: string, name: string) {
-  const repoName = name.replace(/\.git$/, "");
-
-  const result = await db
-    .select({
-      id: repositories.id,
-      name: repositories.name,
-      ownerId: repositories.ownerId,
-      visibility: repositories.visibility,
-      userId: users.id,
-    })
-    .from(repositories)
-    .innerJoin(users, eq(users.id, repositories.ownerId))
-    .where(and(eq(users.username, owner), eq(repositories.name, repoName)))
-    .limit(1);
-
-  const row = result[0];
-  if (!row) {
-    return null;
-  }
-
-  const store = createGitStore(row.userId, row.name);
-  return {
-    repo: {
-      id: row.id,
-      name: row.name,
-      ownerId: row.ownerId,
-      visibility: row.visibility,
-    },
-    store,
-    userId: row.userId,
-  };
-}
-
-async function canReadRepository(repo: { id: string; ownerId: string; visibility: string }, currentUser: AuthUser | null): Promise<boolean> {
+async function canReadRepository(repo: { id: string; ownerId: string; organizationId?: string | null; visibility: string }, currentUser: AuthUser | null): Promise<boolean> {
   // Admins always have read access (but need valid id)
   if (currentUser?.role === "admin" && currentUser?.id) {
     return true;
@@ -226,12 +191,12 @@ app.get("/:owner/:name/info/refs", async (c) => {
     return c.json({ error: "Invalid service" }, 404);
   }
 
-  const result = await getRepoAndStore(owner, name);
-  if (!result) {
+  const repo = await resolveRepositoryBySlug(owner, name);
+  if (!repo) {
     return c.json({ error: "Repository not found" }, 404);
   }
 
-  const { repo, store } = result;
+  const store = createRepoGitStore(repo);
 
   if (service === "git-receive-pack") {
     if (!(await canWriteRepository(repo, currentUser))) {
@@ -269,12 +234,12 @@ app.post("/:owner/:name/git-upload-pack", async (c) => {
   const name = c.req.param("name");
   const currentUser = await resolveGitUser(c);
 
-  const result = await getRepoAndStore(owner, name);
-  if (!result) {
+  const repo = await resolveRepositoryBySlug(owner, name);
+  if (!repo) {
     return c.json({ error: "Repository not found" }, 404);
   }
 
-  const { repo, store } = result;
+  const store = createRepoGitStore(repo);
 
   if (!(await canReadRepository(repo, currentUser))) {
     return unauthorizedBasic();
@@ -947,12 +912,12 @@ app.post("/:owner/:name/git-receive-pack", async (c) => {
   const name = c.req.param("name");
   const currentUser = await resolveGitUser(c);
 
-  const result = await getRepoAndStore(owner, name);
-  if (!result) {
+  const repo = await resolveRepositoryBySlug(owner, name);
+  if (!repo) {
     return c.json({ error: "Repository not found" }, 404);
   }
 
-  const { repo, store } = result;
+  const store = createRepoGitStore(repo);
 
   if (!(await canWriteRepository(repo, currentUser))) {
     return unauthorizedBasic();
@@ -1032,7 +997,7 @@ app.post("/:owner/:name/git-receive-pack", async (c) => {
     const storeObject = async (oid: string, type: string, data: Buffer) => {
       const prefix = oid.substring(0, 2);
       const suffix = oid.substring(2);
-      const objectPath = `repos/${result.userId}/${repo.name}/objects/${prefix}/${suffix}`;
+      const objectPath = `repos/${repo.storageOwnerId}/${repo.name}/objects/${prefix}/${suffix}`;
 
       const header = `${type} ${data.length}\0`;
       const store = Buffer.concat([Buffer.from(header), data]);
@@ -1041,7 +1006,7 @@ app.post("/:owner/:name/git-receive-pack", async (c) => {
       await putObject(objectPath, compressed);
     };
 
-    const basePath = `repos/${result.userId}/${repo.name}`;
+    const basePath = `repos/${repo.storageOwnerId}/${repo.name}`;
     console.log(`[API] receive-pack: unpacking pack file (${packData.length} bytes)`);
     const unpackResult = await unpackPackFile(packData, storeObject, basePath);
     if (!unpackResult.success) {
@@ -1052,7 +1017,7 @@ app.post("/:owner/:name/git-receive-pack", async (c) => {
 
     for (const update of updates) {
       const refPath = update.ref.startsWith("refs/") ? update.ref : `refs/heads/${update.ref}`;
-      const refKey = `repos/${result.userId}/${repo.name}/${refPath}`;
+      const refKey = `repos/${repo.storageOwnerId}/${repo.name}/${refPath}`;
 
       if (update.newOid === "0".repeat(40)) {
         await deleteObject(refKey).catch(() => {});
@@ -1067,7 +1032,7 @@ app.post("/:owner/:name/git-receive-pack", async (c) => {
         ? updates[0].ref.replace("refs/heads/", "")
         : updates[0].ref;
       const headRef = `refs/heads/${defaultBranch}`;
-      const headKey = `repos/${result.userId}/${repo.name}/HEAD`;
+      const headKey = `repos/${repo.storageOwnerId}/${repo.name}/HEAD`;
       await putObject(headKey, Buffer.from(`ref: ${headRef}\n`));
 
 
@@ -1075,7 +1040,7 @@ app.post("/:owner/:name/git-receive-pack", async (c) => {
         const branch = update.ref.startsWith("refs/heads/")
           ? update.ref.replace("refs/heads/", "")
           : update.ref;
-        await repoCache.invalidateBranch(result.userId, repo.name, branch);
+        await repoCache.invalidateBranch(repo.storageOwnerId, repo.name, branch);
       }
 
       // Sync workflows and trigger CI — fire-and-forget

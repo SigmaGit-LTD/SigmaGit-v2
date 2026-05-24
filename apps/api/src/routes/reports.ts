@@ -18,7 +18,6 @@ function isReportReason(value: unknown): value is ReportReason {
 
 const app = new Hono<{ Variables: AuthVariables }>();
 
-app.use("*", authMiddleware);
 
 app.post("/api/reports", requireAuth, async (c) => {
   const user = c.get("user");

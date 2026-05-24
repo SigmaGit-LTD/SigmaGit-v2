@@ -1,13 +1,12 @@
 import { Hono } from "hono";
 import { db, organizations, organizationMembers, teams, teamMembers, teamRepositories, organizationInvitations, users, repositories } from "@sigmagit/db";
 import { eq, and, sql, desc } from "drizzle-orm";
-import { authMiddleware, requireAuth, type AuthVariables } from "../middleware/auth";
+import { requireAuth, type AuthVariables } from "../middleware/auth";
+import { canAccessRepository } from "../lib/access";
 import { logAuditEvent } from "./admin";
 import { randomUUID } from "crypto";
 
 const app = new Hono<{ Variables: AuthVariables }>();
-
-app.use("*", authMiddleware);
 
 app.post("/api/organizations", requireAuth, async (c) => {
   const user = c.get("user")!;
@@ -796,6 +795,7 @@ app.delete("/api/organizations/:org/teams/:team/repos/:repo", requireAuth, async
 
 app.get("/api/organizations/:org/repositories", async (c) => {
   const orgName = c.req.param("org");
+  const currentUser = c.get("user");
 
   const [org] = await db
     .select()
@@ -812,7 +812,18 @@ app.get("/api/organizations/:org/repositories", async (c) => {
     .where(eq(repositories.organizationId, org.id))
     .orderBy(desc(repositories.createdAt));
 
-  const reposWithOwner = repos.map((repo) => ({
+  const accessibleRepos = (
+    await Promise.all(
+      repos.map(async (repo) => ({
+        repo,
+        allowed: await canAccessRepository(repo, currentUser),
+      }))
+    )
+  )
+    .filter(({ allowed }) => allowed)
+    .map(({ repo }) => repo);
+
+  const reposWithOwner = accessibleRepos.map((repo) => ({
     ...repo,
     owner: {
       id: org.id,

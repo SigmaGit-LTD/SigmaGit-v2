@@ -22,7 +22,7 @@ import {
 import { eq, sql, desc, count, and, or, ilike, gte, lte, inArray, lt, notInArray } from "drizzle-orm";
 import { authMiddleware, requireAdmin, invalidateCachedUser, type AuthVariables } from "../middleware/auth";
 import { parseLimit, parseOffset } from "../lib/validation";
-import { repoCache } from "../cache";
+import { repoCache } from "../redis";
 import { createGitStore, getCommitCountCached, listBranchesCached } from "../git";
 import { copyPrefix, deletePrefix, getRepoPrefix } from "../s3";
 
@@ -41,7 +41,6 @@ function isApplicationStatus(value: unknown): value is ApplicationStatus {
   return typeof value === "string" && APPLICATION_STATUSES.includes(value as ApplicationStatus);
 }
 
-app.use("*", authMiddleware);
 app.use("*", requireAdmin);
 
 export async function logAuditEvent(

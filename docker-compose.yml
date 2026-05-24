@@ -1,23 +1,21 @@
 services:
-  # ─── Infrastructure ───────────────────────────────────────────────────────────
-
   postgres:
     image: postgres:16-alpine
     restart: unless-stopped
     environment:
       POSTGRES_USER: sigmagit
-      POSTGRES_PASSWORD: sigmagit
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-sigmagit}
       POSTGRES_DB: sigmagit
     volumes:
       - postgres_data:/var/lib/postgresql/data
-    ports:
-      - '5432:5432'
     healthcheck:
       test: ['CMD-SHELL', 'pg_isready -U sigmagit -d sigmagit']
       interval: 10s
       timeout: 5s
       retries: 5
       start_period: 20s
+    networks:
+      - sigmagit
 
   redis:
     image: redis:7-alpine
@@ -25,14 +23,83 @@ services:
     command: redis-server --appendonly yes
     volumes:
       - redis_data:/data
-    ports:
-      - '6379:6379'
     healthcheck:
       test: ['CMD', 'redis-cli', 'ping']
       interval: 10s
       timeout: 5s
       retries: 5
+    networks:
+      - sigmagit
+
+  api:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      TRUST_PROXY: 'true'
+      REDIS_URL: redis://redis:6379
+      DATABASE_URL: postgresql://sigmagit:${POSTGRES_PASSWORD:-sigmagit}@postgres:5432/sigmagit
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    expose:
+      - '3001'
+    healthcheck:
+      test: ['CMD', 'wget', '-qO-', 'http://localhost:3001/health']
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - sigmagit
+
+  web:
+    build:
+      context: .
+      dockerfile: apps/web/Dockerfile
+      args:
+        API_URL: ${WEB_URL:-http://localhost}
+        VITE_API_URL: ${WEB_URL:-http://localhost}
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_healthy
+    expose:
+      - '3000'
+    networks:
+      - sigmagit
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - '80:80'
+      - '443:443'
+    environment:
+      API_UPSTREAM: api:3001
+      WEB_UPSTREAM: web:3000
+      DOCS_UPSTREAM: host.docker.internal:3003
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - api
+      - web
+    networks:
+      - sigmagit
+
+networks:
+  sigmagit:
+    driver: bridge
 
 volumes:
   postgres_data:
   redis_data:
+  caddy_data:
+  caddy_config:

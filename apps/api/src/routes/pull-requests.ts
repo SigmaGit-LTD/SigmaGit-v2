@@ -13,17 +13,16 @@ import {
   labels,
 } from "@sigmagit/db";
 import { eq, sql, and, desc, or, inArray } from "drizzle-orm";
-import { authMiddleware, requireAuth, type AuthVariables } from "../middleware/auth";
+import { requireAuth, type AuthVariables } from "../middleware/auth";
 import { parseLimit, parseOffset } from "../lib/validation";
 import { canAccessRepository } from "../lib/access";
+import { getStorageOwnerId } from "../lib/repo-helpers";
 import { writeRateLimit } from "../middleware/rate-limit";
 import { createGitStore, getCommits, getTree, getCommitDiff, performMerge, squashMerge, rebaseMerge, repoCache } from "../git";
 import { deliverWebhookEvent } from "./repo-webhooks";
 import { triggerWorkflows } from "../workflows/trigger";
 
 const app = new Hono<{ Variables: AuthVariables }>();
-
-app.use("*", authMiddleware);
 
 const VALID_EMOJIS = ["+1", "-1", "laugh", "hooray", "confused", "heart", "rocket", "eyes"];
 
@@ -855,7 +854,7 @@ app.get("/api/pulls/:id/diff", async (c) => {
     return c.json({ error: "Repository not found" }, 404);
   }
 
-  if (!(await canAccessRepository(repo, currentUser?.id))) {
+  if (!(await canAccessRepository(repo, currentUser))) {
     return c.json({ error: "Repository not found" }, 404);
   }
 
@@ -910,7 +909,7 @@ app.get("/api/pulls/:id/commits", async (c) => {
     return c.json({ error: "Repository not found" }, 404);
   }
 
-  if (!(await canAccessRepository(repo, currentUser?.id))) {
+  if (!(await canAccessRepository(repo, currentUser))) {
     return c.json({ error: "Repository not found" }, 404);
   }
 
@@ -984,8 +983,8 @@ app.post("/api/pulls/:id/merge", requireAuth, async (c) => {
     return c.json({ error: "Head repository not found" }, 404);
   }
 
-  const baseStore = createGitStore(baseRepo.ownerId, baseRepo.name);
-  const headStore = createGitStore(headRepo.ownerId, headRepo.name);
+  const baseStore = createGitStore(getStorageOwnerId(baseRepo), baseRepo.name);
+  const headStore = createGitStore(getStorageOwnerId(headRepo), headRepo.name);
 
   const mergeStrategy = body.mergeStrategy ?? "merge";
   const mergeMessage = body.commitMessage || `Merge pull request #${pr.number} from ${pr.headBranch}\n\n${pr.title}`;
@@ -1023,7 +1022,7 @@ app.post("/api/pulls/:id/merge", requireAuth, async (c) => {
     })
     .where(eq(pullRequests.id, id));
 
-  await repoCache.invalidateBranch(baseRepo.ownerId, baseRepo.name, pr.baseBranch);
+  await repoCache.invalidateBranch(getStorageOwnerId(baseRepo), baseRepo.name, pr.baseBranch);
 
   // Fire webhook
   deliverWebhookEvent(pr.repositoryId, "pull_request", {

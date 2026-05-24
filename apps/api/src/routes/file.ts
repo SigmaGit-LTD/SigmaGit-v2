@@ -1,18 +1,15 @@
 import { Hono } from "hono";
-import { db, users, repositories } from "@sigmagit/db";
-import { eq, and } from "drizzle-orm";
-import { authMiddleware, type AuthVariables } from "../middleware/auth";
+import { type AuthVariables } from "../middleware/auth";
 import { sanitizePathForGit } from "../lib/validation";
 import { canAccessRepository } from "../lib/access";
-import { createGitStore, getFile } from "../git";
+import { resolveRepositoryBySlug, createRepoGitStore } from "../lib/repo-helpers";
+import { getFile } from "../git";
 
 const app = new Hono<{ Variables: AuthVariables }>();
 
-app.use("*", authMiddleware);
-
 app.get("/file/:username/:repo/:branch/*", async (c) => {
   const username = c.req.param("username");
-  const repo = c.req.param("repo");
+  const repoName = c.req.param("repo");
   const branch = c.req.param("branch");
   const rawPath = c.req.param("*") || "";
   const filePath = sanitizePathForGit(rawPath);
@@ -21,28 +18,16 @@ app.get("/file/:username/:repo/:branch/*", async (c) => {
   }
   const currentUser = c.get("user");
 
-  const result = await db
-    .select({
-      ownerId: repositories.ownerId,
-      visibility: repositories.visibility,
-      userId: users.id,
-      repoName: repositories.name,
-    })
-    .from(repositories)
-    .innerJoin(users, eq(users.id, repositories.ownerId))
-    .where(and(eq(users.username, username), eq(repositories.name, repo)))
-    .limit(1);
-
-  const row = result[0];
-  if (!row) {
+  const repo = await resolveRepositoryBySlug(username, repoName);
+  if (!repo) {
     return c.json({ error: "Repository not found" }, 404);
   }
 
-  if (!(await canAccessRepository({ id: row.userId, ownerId: row.ownerId, visibility: row.visibility }, currentUser))) {
+  if (!(await canAccessRepository(repo, currentUser))) {
     return c.json({ error: "Repository not found" }, 404);
   }
 
-  const store = createGitStore(row.userId, row.repoName);
+  const store = createRepoGitStore(repo);
   const file = await getFile(store.fs, store.dir, branch, filePath);
 
   if (!file) {

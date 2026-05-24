@@ -7,7 +7,6 @@ import { encryptCredential, decryptCredential } from "../lib/credential-cipher";
 
 const app = new Hono<{ Variables: AuthVariables }>();
 
-app.use("*", authMiddleware);
 
 app.post("/api/migrations", requireAuth, async (c) => {
   const user = c.get("user")!;

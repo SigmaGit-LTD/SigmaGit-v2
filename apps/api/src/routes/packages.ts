@@ -8,7 +8,6 @@ import { listManifestRefs } from "../registry/storage";
 const app = new Hono<{ Variables: AuthVariables }>();
 const REGISTRY_PREFIX = "registry/";
 
-app.use("*", authMiddleware);
 
 /** Extract unique image names from registry keys under registry/owner/ */
 async function getImageNamesForOwner(owner: string): Promise<string[]> {

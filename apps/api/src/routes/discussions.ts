@@ -15,7 +15,6 @@ import { canAccessRepository } from "../lib/access";
 
 const app = new Hono<{ Variables: AuthVariables }>();
 
-app.use("*", authMiddleware);
 
 const VALID_EMOJIS = ["+1", "-1", "laugh", "hooray", "confused", "heart", "rocket", "eyes"];
 

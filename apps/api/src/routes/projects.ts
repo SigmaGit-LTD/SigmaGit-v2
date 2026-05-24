@@ -10,12 +10,10 @@ import {
   pullRequests,
 } from "@sigmagit/db";
 import { eq, sql, and, asc, inArray } from "drizzle-orm";
-import { authMiddleware, requireAuth, type AuthVariables } from "../middleware/auth";
+import { requireAuth, type AuthVariables } from "../middleware/auth";
 import { canAccessRepository } from "../lib/access";
 
 const app = new Hono<{ Variables: AuthVariables }>();
-
-app.use("*", authMiddleware);
 
 async function getRepoAndCheckAccess(owner: string, name: string, user?: { id: string; role?: string } | null) {
   const result = await db
@@ -181,7 +179,7 @@ app.get("/api/projects/:id", async (c) => {
     return c.json({ error: "Repository not found" }, 404);
   }
 
-  if (!(await canAccessRepository(repo, currentUser?.id))) {
+  if (!(await canAccessRepository(repo, currentUser))) {
     return c.json({ error: "Project not found" }, 404);
   }
 

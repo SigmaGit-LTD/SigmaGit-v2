@@ -1,14 +1,16 @@
 import { Hono } from "hono";
-import { eq, and } from "drizzle-orm";
+import { eq } from "drizzle-orm";
 import { db, users, discordLinks, linkTokens } from "@sigmagit/db";
 import { randomBytes } from "crypto";
+import { authMiddleware, requireAuth, type AuthVariables } from "../middleware/auth";
 function calculateTokenExpiry(): Date {
   const expiry = new Date();
   expiry.setHours(expiry.getHours() + 24);
   return expiry;
 }
 
-const app = new Hono();
+const app = new Hono<{ Variables: AuthVariables }>();
+
 
 interface LinkRequest {
   discordId: string;
@@ -35,39 +37,16 @@ async function generateLinkTokenForUser(discordId: string, userId: string): Prom
   return token;
 }
 
-app.post('/api/discord/link/generate', async (c) => {
+app.post('/api/discord/link/generate', requireAuth, async (c) => {
   try {
-    const { discordId, sigmagitEmail } = await c.req.json() as LinkRequest;
+    const user = c.get("user")!;
+    const { discordId } = await c.req.json() as LinkRequest;
 
     if (!discordId) {
       return c.json({ error: 'Discord ID is required' }, 400);
     }
 
-    let userId = null;
-
-    if (sigmagitEmail) {
-      const user = await db.query.users.findFirst({
-        where: eq(users.email, sigmagitEmail),
-      });
-
-      if (!user) {
-        return c.json({ error: 'User not found with that email' }, 404);
-      }
-
-      userId = user.id;
-    } else {
-      const existingLink = await db.query.discordLinks.findFirst({
-        where: eq(discordLinks.discordId, discordId),
-      });
-
-      if (existingLink && existingLink.sigmagitUserId) {
-        userId = existingLink.sigmagitUserId;
-      } else {
-        return c.json({ error: 'No user ID provided and no existing link found' }, 400);
-      }
-    }
-
-    const token = await generateLinkTokenForUser(discordId, userId);
+    const token = await generateLinkTokenForUser(discordId, user.id);
 
     return c.json({ success: true, token });
   } catch (error) {

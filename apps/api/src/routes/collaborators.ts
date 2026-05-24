@@ -6,7 +6,6 @@ import { canAccessRepository } from "../lib/access";
 
 const app = new Hono<{ Variables: AuthVariables }>();
 
-app.use("*", authMiddleware);
 
 // ─── Helper: check if user is repo owner or admin collaborator ───────────────
 

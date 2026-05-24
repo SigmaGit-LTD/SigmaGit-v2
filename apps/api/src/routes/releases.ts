@@ -7,7 +7,6 @@ import { putObject, getObjectStream, deleteObject } from "../storage";
 
 const app = new Hono<{ Variables: AuthVariables }>();
 
-app.use("*", authMiddleware);
 
 app.get("/api/repositories/:owner/:name/releases", async (c) => {
   const owner = c.req.param("owner");

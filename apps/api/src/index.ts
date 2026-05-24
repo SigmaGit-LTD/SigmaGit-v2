@@ -5,13 +5,21 @@ import { initAuth } from "./auth";
 import { getRedis } from "./redis";
 import { mountRoutes } from "./routes";
 import { handleWebSocketUpgrade, websocketHandlers } from "./websocket";
-import { memoryMiddleware, requestSizeMiddleware, gitLimitsMiddleware } from "./middleware/limits";
-import { generalRateLimit, apiKeyRateLimit, unauthenticatedRateLimit, concurrencyLimiter } from "./middleware/rate-limit";
+import {
+  memoryMiddleware,
+  requestSizeMiddleware,
+  gitLimitsMiddleware,
+  responseSizeMiddleware,
+} from "./middleware/limits";
+import rateLimitMiddleware, { concurrencyLimiter } from "./middleware/rate-limit";
+import { authMiddleware } from "./middleware/auth";
+import { requestIdMiddleware } from "./middleware/request-id";
+import { requestTimeoutMiddleware } from "./middleware/timeout";
+import { compressionMiddleware } from "./middleware/compression";
 import { startMigrationWorker } from "./workers/migration";
 import { startRunnerHealthWorker } from "./workers/runner-health";
 import "./monitoring";
 
-// Log Redis connection status at startup
 if (config.redisUrl) {
   const redis = await getRedis();
   if (redis) {
@@ -50,9 +58,9 @@ const loggingMiddleware = createMiddleware(async (c, next) => {
   }
 });
 
+app.use("*", requestIdMiddleware);
 app.use("*", loggingMiddleware);
 
-// CORS headers for all actual (non-OPTIONS) responses
 app.use("*", createMiddleware(async (c, next) => {
   const origin = c.req.header("origin");
   const allowedOrigins = getAllowedOrigins();
@@ -71,22 +79,22 @@ app.use("*", createMiddleware(async (c, next) => {
   await next();
 }));
 
+app.use("*", authMiddleware);
 app.use("*", concurrencyLimiter());
 app.use("*", memoryMiddleware);
 app.use("*", requestSizeMiddleware);
 app.use("*", gitLimitsMiddleware);
-app.use("*", generalRateLimit);
-app.use("*", apiKeyRateLimit);
-app.use("*", unauthenticatedRateLimit());
+app.use("*", requestTimeoutMiddleware());
+app.use("*", rateLimitMiddleware);
+app.use("*", responseSizeMiddleware);
+app.use("*", compressionMiddleware);
 
 mountRoutes(app);
 
-// Start migration worker
 if (config.enableMigrations) {
   startMigrationWorker();
 }
 
-// Start runner health worker (always enabled)
 startRunnerHealthWorker();
 
 const port = config.port;
@@ -94,9 +102,6 @@ const port = config.port;
 export default {
   port,
   fetch: async (request: Request, server: any) => {
-    // Handle ALL OPTIONS preflight requests at the Bun level — completely outside Hono.
-    // This is the only reliable way to guarantee a clean CORS preflight response with no
-    // interference from auth middleware, memory limits, or sub-router middleware.
     if (request.method === "OPTIONS") {
       const origin = request.headers.get("origin");
       const allowedOrigins = getAllowedOrigins();
@@ -106,7 +111,7 @@ export default {
         headers: {
           "Access-Control-Allow-Origin": isAllowed ? origin : (allowedOrigins[0] ?? ""),
           "Access-Control-Allow-Methods": "GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD",
-          "Access-Control-Allow-Headers": "Content-Type, Authorization, Cookie, x-internal-auth, X-Webhook-Secret",
+          "Access-Control-Allow-Headers": "Content-Type, Authorization, Cookie, x-internal-auth, X-Webhook-Secret, X-Request-Id",
           "Access-Control-Allow-Credentials": "true",
           "Access-Control-Max-Age": "300",
         },

@@ -125,15 +125,35 @@ export function NostrAuthButton({
         throw new Error("No public key returned from extension");
       }
 
-      // 2. Fetch profile metadata
+      // 2. Fetch server challenge (NIP-42)
+      setStatus("Requesting challenge...");
+      const challengeRes = await fetch(`${getApiUrl()}/api/auth/nostr/challenge`, {
+        credentials: "include",
+      });
+      if (!challengeRes.ok) {
+        throw new Error("Failed to get authentication challenge");
+      }
+      const { challenge } = (await challengeRes.json()) as { challenge: string };
+
+      // 3. Sign challenge event with extension
+      setStatus("Signing challenge...");
+      const signedEvent = await window.nostr.signEvent({
+        kind: 22242,
+        pubkey,
+        created_at: Math.floor(Date.now() / 1000),
+        tags: [["challenge", challenge]],
+        content: "",
+      });
+
+      // 4. Fetch profile metadata
       setStatus("Fetching profile...");
       const profile = await fetchNostrProfile(pubkey);
 
-      // 3. Check for NWC (optional)
+      // 5. Check for NWC (optional)
       setStatus("Checking for Lightning wallet...");
       const nwcConnectionString = await getNWCConnectionString();
 
-      // 4. Send to server
+      // 6. Send to server
       setStatus("Authenticating with server...");
       const response = await fetch(`${getApiUrl()}/api/auth/nostr`, {
         method: "POST",
@@ -143,6 +163,8 @@ export function NostrAuthButton({
         credentials: "include",
         body: JSON.stringify({
           npub: pubkey,
+          challenge,
+          event: signedEvent,
           profile: profile || undefined,
           nwcConnectionString: nwcConnectionString || undefined,
         }),

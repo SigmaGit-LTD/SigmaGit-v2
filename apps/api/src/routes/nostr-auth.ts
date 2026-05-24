@@ -5,8 +5,12 @@ import { db, users, sessions } from "@sigmagit/db";
 import { getAuth } from "../auth";
 import { config } from "../config";
 import { invalidateCachedUser } from "../middleware/auth";
+import { authRateLimitOnFailure } from "../middleware/rate-limit";
+import { createNostrChallenge, consumeNostrChallenge } from "../lib/nostr-challenge";
 
 const app = new Hono();
+
+app.use("/api/auth/nostr*", authRateLimitOnFailure);
 
 console.log("[Nostr Auth] Routes loading...");
 
@@ -115,47 +119,100 @@ function generateTempEmailFromNpub(npub: string): string {
   return `nostr_${suffix}@sigmagit.com`;
 }
 
+interface NostrAuthEvent {
+  kind: number;
+  pubkey: string;
+  created_at: number;
+  tags: string[][];
+  content: string;
+  id: string;
+  sig: string;
+}
+
+async function normalizePubkeyInput(npub: string): Promise<{ normalizedNpub: string; hexPubkey: string | null }> {
+  let normalizedNpub = npub;
+  let hexPubkey: string | null = null;
+
+  if (npub.startsWith("npub1")) {
+    try {
+      const { nip19 } = await getNostrTools();
+      const decoded = nip19.decode(npub);
+      if (decoded.type === "npub") {
+        hexPubkey = decoded.data as string;
+      }
+    } catch {
+      // continue with npub as-is
+    }
+  } else if (/^[0-9a-fA-F]{64}$/.test(npub)) {
+    hexPubkey = npub.toLowerCase();
+    const converted = await hexToNpub(hexPubkey);
+    if (converted) {
+      normalizedNpub = converted;
+    } else {
+      throw new Error("Invalid hex public key format");
+    }
+  } else {
+    throw new Error("Invalid public key format. Expected npub1... or 64-char hex");
+  }
+
+  return { normalizedNpub, hexPubkey };
+}
+
+async function verifyNostrAuthEvent(
+  event: NostrAuthEvent,
+  expectedChallenge: string,
+  expectedHexPubkey: string | null
+): Promise<boolean> {
+  if (event.kind !== 22242) {
+    return false;
+  }
+
+  if (expectedHexPubkey && event.pubkey.toLowerCase() !== expectedHexPubkey.toLowerCase()) {
+    return false;
+  }
+
+  const challengeTag = event.tags.find((tag) => tag[0] === "challenge");
+  if (!challengeTag?.[1] || challengeTag[1] !== expectedChallenge) {
+    return false;
+  }
+
+  const { verifyEvent } = await getNostrTools();
+  return verifyEvent(event as any);
+}
+
+// GET /api/auth/nostr/challenge - Issue one-time auth challenge (NIP-42)
+app.get("/api/auth/nostr/challenge", async (c) => {
+  const challenge = await createNostrChallenge();
+  return c.json({ challenge });
+});
+
 // POST /api/auth/nostr - Sign in or sign up with Nostr
 app.post("/api/auth/nostr", async (c) => {
   try {
     const body = await c.req.json<{
       npub: string;
+      event: NostrAuthEvent;
+      challenge: string;
       profile?: NostrProfile;
       nwcConnectionString?: string;
     }>();
 
-    const { npub, profile: clientProfile, nwcConnectionString } = body;
+    const { npub, event, challenge, profile: clientProfile, nwcConnectionString } = body;
 
-    if (!npub) {
-      return c.json({ error: "Nostr public key (npub) is required" }, 400);
+    if (!npub || !event || !challenge) {
+      return c.json({ error: "npub, signed event, and challenge are required" }, 400);
     }
 
-    // Normalize pubkey - accept both hex and npub formats
-    let normalizedNpub = npub;
-    let hexPubkey: string | null = null;
+    const challengeValid = await consumeNostrChallenge(challenge);
+    if (!challengeValid) {
+      return c.json({ error: "Invalid or expired challenge" }, 401);
+    }
 
-    if (npub.startsWith("npub1")) {
-      // Already in npub format, try to decode to hex for profile fetching
-      try {
-        const { nip19 } = await getNostrTools();
-        const decoded = nip19.decode(npub);
-        if (decoded.type === "npub") {
-          hexPubkey = decoded.data as string;
-        }
-      } catch {
-        // Continue with npub as-is
-      }
-    } else if (/^[0-9a-fA-F]{64}$/.test(npub)) {
-      // Hex format - convert to npub
-      hexPubkey = npub.toLowerCase();
-      const converted = await hexToNpub(hexPubkey);
-      if (converted) {
-        normalizedNpub = converted;
-      } else {
-        return c.json({ error: "Invalid hex public key format" }, 400);
-      }
-    } else {
-      return c.json({ error: "Invalid public key format. Expected npub1... or 64-char hex" }, 400);
+    const { normalizedNpub, hexPubkey } = await normalizePubkeyInput(npub);
+
+    const signatureValid = await verifyNostrAuthEvent(event, challenge, hexPubkey);
+    if (!signatureValid) {
+      return c.json({ error: "Invalid Nostr signature" }, 401);
     }
 
     // Check if user already exists with this npub
@@ -316,22 +373,27 @@ app.post("/api/auth/nostr/link", async (c) => {
     const currentUser = sessionResult.user;
     const body = await c.req.json<{
       npub: string;
+      event: NostrAuthEvent;
+      challenge: string;
       nwcConnectionString?: string;
     }>();
 
-    const { npub, nwcConnectionString } = body;
+    const { npub, event, challenge, nwcConnectionString } = body;
 
-    if (!npub) {
-      return c.json({ error: "Nostr public key (npub) is required" }, 400);
+    if (!npub || !event || !challenge) {
+      return c.json({ error: "npub, signed event, and challenge are required" }, 400);
     }
 
-    // Normalize pubkey
-    let normalizedNpub = npub;
-    if (!npub.startsWith("npub1") && /^[0-9a-fA-F]{64}$/.test(npub)) {
-      const converted = await hexToNpub(npub.toLowerCase());
-      if (converted) {
-        normalizedNpub = converted;
-      }
+    const challengeValid = await consumeNostrChallenge(challenge);
+    if (!challengeValid) {
+      return c.json({ error: "Invalid or expired challenge" }, 401);
+    }
+
+    const { normalizedNpub, hexPubkey } = await normalizePubkeyInput(npub);
+
+    const signatureValid = await verifyNostrAuthEvent(event, challenge, hexPubkey);
+    if (!signatureValid) {
+      return c.json({ error: "Invalid Nostr signature" }, 401);
     }
 
     // Check if npub is already linked to another user
@@ -341,20 +403,6 @@ app.post("/api/auth/nostr/link", async (c) => {
 
     if (existingUser && existingUser.id !== currentUser.id) {
       return c.json({ error: "This Nostr key is already linked to another account" }, 409);
-    }
-
-    // Fetch profile
-    let hexPubkey: string | null = null;
-    if (normalizedNpub.startsWith("npub1")) {
-      try {
-        const { nip19 } = await getNostrTools();
-        const decoded = nip19.decode(normalizedNpub);
-        if (decoded.type === "npub") {
-          hexPubkey = decoded.data as string;
-        }
-      } catch {
-        // Continue
-      }
     }
 
     let profile: NostrProfile | null = null;

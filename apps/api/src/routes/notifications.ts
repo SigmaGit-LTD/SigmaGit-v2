@@ -8,7 +8,6 @@ import { sendNotificationEmail } from "../email";
 
 const app = new Hono<{ Variables: AuthVariables }>();
 
-app.use("*", authMiddleware);
 
 async function getUsersByIds(userIds: string[]) {
   if (userIds.length === 0) return new Map<string, { id: string; username: string; name: string; avatarUrl: string | null }>();

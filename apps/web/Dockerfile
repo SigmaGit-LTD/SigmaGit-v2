@@ -1,4 +1,4 @@
-FROM oven/bun:1 AS builder
+FROM oven/bun:1.3.5 AS builder
 
 WORKDIR /app
 
@@ -29,7 +29,7 @@ WORKDIR /app/apps/web
 ENV NODE_ENV=production
 RUN bun run build
 
-FROM oven/bun:1-alpine AS runner
+FROM oven/bun:1.3.5-alpine AS runner
 
 WORKDIR /app
 

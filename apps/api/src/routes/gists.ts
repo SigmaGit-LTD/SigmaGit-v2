@@ -15,7 +15,6 @@ function isGistVisibility(value: unknown): value is GistVisibility {
   return typeof value === "string" && GIST_VISIBILITIES.includes(value as GistVisibility);
 }
 
-app.use("*", authMiddleware);
 
 function groupFilesByGistId(files: Array<{ gistId: string }>) {
   const filesByGistId = new Map<string, Array<(typeof files)[number]>>();

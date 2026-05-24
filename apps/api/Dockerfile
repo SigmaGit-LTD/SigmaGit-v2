@@ -1,4 +1,4 @@
-FROM oven/bun:1.1 AS builder
+FROM oven/bun:1.3.5 AS builder
 
 WORKDIR /app
 
@@ -21,7 +21,7 @@ COPY apps/api ./apps/api
 WORKDIR /app/apps/api
 RUN bun build src/index.ts --outdir dist --target bun --minify
 
-FROM oven/bun:1.1-alpine AS runner
+FROM oven/bun:1.3.5-alpine AS runner
 
 WORKDIR /app
 
@@ -33,5 +33,7 @@ ENV NODE_ENV=production
 ENV PORT=3001
 
 EXPOSE 3001
+
+HEALTHCHECK CMD wget -qO- http://localhost:3001/health || exit 1
 
 CMD ["bun", "run", "dist/index.js"]

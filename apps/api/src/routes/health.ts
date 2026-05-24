@@ -3,8 +3,10 @@ import { sql } from "drizzle-orm";
 import { getObject, listObjects } from "../s3";
 import { db, users, repositories, organizations, systemSettings } from "@sigmagit/db";
 import { eq, and } from "drizzle-orm";
+import { config } from "../config";
+import { authMiddleware, requireAdmin, type AuthVariables } from "../middleware/auth";
 
-const app = new Hono();
+const app = new Hono<{ Variables: AuthVariables }>();
 
 app.get("/health", (c) => {
   return c.json({ status: "ok", version: "1.0.0" });
@@ -45,7 +47,11 @@ app.get("/api/stats/platform", async (c) => {
   });
 });
 
-app.get("/api/debug/repo/:owner/:name", async (c) => {
+app.get("/api/debug/repo/:owner/:name", authMiddleware, requireAdmin, async (c) => {
+  if (config.isProduction) {
+    return c.json({ error: "Not found" }, 404);
+  }
+
   const owner = c.req.param("owner");
   const name = c.req.param("name");
 

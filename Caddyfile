@@ -1,48 +1,73 @@
 {
-    # Global options
     email bh@sigmagaming.net
 }
 
-# Replace with your actual domain or localhost for testing
 sigmagit.com {
-    # Git smart HTTP requests (clone/fetch/push)
+    handle /health {
+        reverse_proxy {$API_UPSTREAM:localhost:3001}
+    }
+
+    handle /api/health {
+        reverse_proxy {$API_UPSTREAM:localhost:3001}
+    }
+
+    handle /ws {
+        reverse_proxy {$API_UPSTREAM:localhost:3001}
+    }
+
+    handle /v2/* {
+        request_body {
+            max_size 500MB
+        }
+        reverse_proxy {$API_UPSTREAM:localhost:3001} {
+            flush_interval -1
+            transport http {
+                read_timeout 600s
+                write_timeout 600s
+            }
+        }
+    }
+
+    handle /file/* {
+        reverse_proxy {$API_UPSTREAM:localhost:3001}
+    }
+
     @git path_regexp git ^/[^/]+/[^/]+\.git(/.*)?$
     handle @git {
-        reverse_proxy localhost:3001
+        request_body {
+            max_size 100MB
+        }
+        reverse_proxy {$API_UPSTREAM:localhost:3001} {
+            flush_interval -1
+            transport http {
+                read_timeout 600s
+                write_timeout 600s
+            }
+        }
     }
 
-    # API requests
     handle /api/* {
-        reverse_proxy localhost:3001
+        reverse_proxy {$API_UPSTREAM:localhost:3001}
     }
 
-    # Web app (TanStack Start)
     handle {
-        reverse_proxy localhost:3000
+        reverse_proxy {$WEB_UPSTREAM:localhost:3000}
     }
 
-    # Git LFS / Large uploads configuration
-    request_body {
-        max_size 500MB
-    }
+    @compressible not path /v2/* /file/* /ws
+    @compressible not path_regexp git ^/[^/]+/[^/]+\.git(/.*)?$
+    encode @compressible zstd gzip
 
-    # Compression
-    encode zstd gzip
-
-    # Logging
     log {
         output stdout
     }
 }
 
-# Documentation site
 docs.sigmagit.com {
-    reverse_proxy localhost:3003
+    reverse_proxy {$DOCS_UPSTREAM:localhost:3003}
 
-    # Compression
     encode zstd gzip
 
-    # Logging
     log {
         output stdout
     }

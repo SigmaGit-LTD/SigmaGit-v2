@@ -1,12 +1,12 @@
 import { Hono } from "hono";
 import { db, users, repositories, stars, repoBranchMetadata } from "@sigmagit/db";
 import { eq, sql, and } from "drizzle-orm";
-import { authMiddleware, requireAuth, type AuthVariables } from "../middleware/auth";
+import { requireAuth, type AuthVariables } from "../middleware/auth";
 import { parseLimit, parseOffset, sanitizePathForGit } from "../lib/validation";
 import { canAccessRepository } from "../lib/access";
+import { resolveRepositoryBySlug, createRepoGitStore } from "../lib/repo-helpers";
 import { deliverWebhookEvent } from "./repo-webhooks";
 import {
-  createGitStore,
   listBranchesCached,
   getCommitsCached,
   getCommitCountCached,
@@ -25,8 +25,6 @@ import {
 } from "../git";
 
 const app = new Hono<{ Variables: AuthVariables }>();
-
-app.use("*", authMiddleware);
 
 async function getForkCount(repoId: string): Promise<number> {
   const [countRow] = await db
@@ -77,48 +75,6 @@ async function getForkedFromInfo(forkedFromId: string | null, currentUserId?: st
   };
 }
 
-async function getRepoAndStore(owner: string, name: string) {
-  const repoName = name.replace(/\.git$/, "");
-
-  const result = await db
-    .select({
-      id: repositories.id,
-      name: repositories.name,
-      description: repositories.description,
-      ownerId: repositories.ownerId,
-      visibility: repositories.visibility,
-      defaultBranch: repositories.defaultBranch,
-      createdAt: repositories.createdAt,
-      updatedAt: repositories.updatedAt,
-      userId: users.id,
-    })
-    .from(repositories)
-    .innerJoin(users, eq(users.id, repositories.ownerId))
-    .where(and(eq(users.username, owner), eq(repositories.name, repoName)))
-    .limit(1);
-
-  const row = result[0];
-  if (!row) {
-    return null;
-  }
-
-  const store = createGitStore(row.userId, row.name);
-  return {
-    repo: {
-      id: row.id,
-      name: row.name,
-      description: row.description,
-      ownerId: row.ownerId,
-      visibility: row.visibility,
-      defaultBranch: row.defaultBranch,
-      createdAt: row.createdAt,
-      updatedAt: row.updatedAt,
-    },
-    store,
-    userId: row.userId,
-  };
-}
-
 async function getUsersByEmails(emails: string[]): Promise<Map<string, { id: string; username: string; avatarUrl: string | null }>> {
   if (emails.length === 0) return new Map();
 
@@ -140,12 +96,12 @@ app.get("/api/repositories/:owner/:name/branches", async (c) => {
   const name = c.req.param("name");
   const currentUser = c.get("user");
 
-  const result = await getRepoAndStore(owner, name);
-  if (!result) {
+  const repo = await resolveRepositoryBySlug(owner, name);
+  if (!repo) {
     return c.json({ error: "Repository not found" }, 404);
   }
 
-  const { repo, store } = result;
+  const store = createRepoGitStore(repo);
 
   if (!(await canAccessRepository(repo, currentUser))) {
     return c.json({ error: "Repository not found" }, 404);
@@ -168,9 +124,9 @@ app.post("/api/repositories/:owner/:name/branches", requireAuth, async (c) => {
     return c.json({ error: "Invalid branch name" }, 400);
   }
 
-  const result = await getRepoAndStore(owner, name);
-  if (!result) return c.json({ error: "Repository not found" }, 404);
-  const { repo, store } = result;
+  const repo = await resolveRepositoryBySlug(owner, name);
+  if (!repo) return c.json({ error: "Repository not found" }, 404);
+  const store = createRepoGitStore(repo);
 
   if (!(await canAccessRepository(repo, currentUser, true))) {
     return c.json({ error: "Not authorized" }, 403);
@@ -202,9 +158,9 @@ app.delete("/api/repositories/:owner/:name/branches/:branch", requireAuth, async
   const branch = c.req.param("branch");
   const currentUser = c.get("user")!;
 
-  const result = await getRepoAndStore(owner, name);
-  if (!result) return c.json({ error: "Repository not found" }, 404);
-  const { repo, store } = result;
+  const repo = await resolveRepositoryBySlug(owner, name);
+  if (!repo) return c.json({ error: "Repository not found" }, 404);
+  const store = createRepoGitStore(repo);
 
   if (currentUser.id !== repo.ownerId) {
     return c.json({ error: "Not authorized" }, 403);
@@ -245,9 +201,9 @@ app.patch("/api/repositories/:owner/:name/default-branch", requireAuth, async (c
     return c.json({ error: "Invalid branch name" }, 400);
   }
 
-  const result = await getRepoAndStore(owner, name);
-  if (!result) return c.json({ error: "Repository not found" }, 404);
-  const { repo, store } = result;
+  const repo = await resolveRepositoryBySlug(owner, name);
+  if (!repo) return c.json({ error: "Repository not found" }, 404);
+  const store = createRepoGitStore(repo);
 
   if (currentUser.id !== repo.ownerId) {
     return c.json({ error: "Not authorized" }, 403);
@@ -288,9 +244,9 @@ app.post("/api/repositories/:owner/:name/file", requireAuth, async (c) => {
     return c.json({ error: "Invalid path" }, 400);
   }
 
-  const result = await getRepoAndStore(owner, name);
-  if (!result) return c.json({ error: "Repository not found" }, 404);
-  const { repo, store } = result;
+  const repo = await resolveRepositoryBySlug(owner, name);
+  if (!repo) return c.json({ error: "Repository not found" }, 404);
+  const store = createRepoGitStore(repo);
 
   if (currentUser.id !== repo.ownerId) {
     return c.json({ error: "Not authorized" }, 403);
@@ -325,9 +281,9 @@ app.get("/api/repositories/:owner/:name/tags", async (c) => {
   const name = c.req.param("name");
   const currentUser = c.get("user");
 
-  const result = await getRepoAndStore(owner, name);
-  if (!result) return c.json({ error: "Repository not found" }, 404);
-  const { repo, store } = result;
+  const repo = await resolveRepositoryBySlug(owner, name);
+  if (!repo) return c.json({ error: "Repository not found" }, 404);
+  const store = createRepoGitStore(repo);
 
   if (!(await canAccessRepository(repo, currentUser))) {
     return c.json({ error: "Repository not found" }, 404);
@@ -354,9 +310,9 @@ app.post("/api/repositories/:owner/:name/tags", requireAuth, async (c) => {
     return c.json({ error: "Invalid tag name" }, 400);
   }
 
-  const result = await getRepoAndStore(owner, name);
-  if (!result) return c.json({ error: "Repository not found" }, 404);
-  const { repo, store } = result;
+  const repo = await resolveRepositoryBySlug(owner, name);
+  if (!repo) return c.json({ error: "Repository not found" }, 404);
+  const store = createRepoGitStore(repo);
 
   if (currentUser.id !== repo.ownerId) {
     return c.json({ error: "Not authorized" }, 403);
@@ -393,9 +349,9 @@ app.delete("/api/repositories/:owner/:name/tags/:tag", requireAuth, async (c) =>
   const tag = c.req.param("tag");
   const currentUser = c.get("user")!;
 
-  const result = await getRepoAndStore(owner, name);
-  if (!result) return c.json({ error: "Repository not found" }, 404);
-  const { repo, store } = result;
+  const repo = await resolveRepositoryBySlug(owner, name);
+  if (!repo) return c.json({ error: "Repository not found" }, 404);
+  const store = createRepoGitStore(repo);
 
   if (currentUser.id !== repo.ownerId) {
     return c.json({ error: "Not authorized" }, 403);
@@ -423,12 +379,12 @@ app.get("/api/repositories/:owner/:name/commits", async (c) => {
   const limit = parseLimit(c.req.query("limit"), 30);
   const skip = parseOffset(c.req.query("skip"), 0);
 
-  const result = await getRepoAndStore(owner, name);
-  if (!result) {
+  const repo = await resolveRepositoryBySlug(owner, name);
+  if (!repo) {
     return c.json({ error: "Repository not found" }, 404);
   }
 
-  const { repo, store } = result;
+  const store = createRepoGitStore(repo);
 
   if (!(await canAccessRepository(repo, currentUser))) {
     return c.json({ error: "Repository not found" }, 404);
@@ -461,12 +417,12 @@ app.get("/api/repositories/:owner/:name/commits/count", async (c) => {
   const currentUser = c.get("user");
   const branch = c.req.query("branch") || "main";
 
-  const result = await getRepoAndStore(owner, name);
-  if (!result) {
+  const repo = await resolveRepositoryBySlug(owner, name);
+  if (!repo) {
     return c.json({ error: "Repository not found" }, 404);
   }
 
-  const { repo, store } = result;
+  const store = createRepoGitStore(repo);
 
   if (!(await canAccessRepository(repo, currentUser))) {
     return c.json({ error: "Repository not found" }, 404);
@@ -490,12 +446,12 @@ app.get("/api/repositories/:owner/:name/commits/:oid/diff", async (c) => {
   const oid = c.req.param("oid");
   const currentUser = c.get("user");
 
-  const result = await getRepoAndStore(owner, name);
-  if (!result) {
+  const repo = await resolveRepositoryBySlug(owner, name);
+  if (!repo) {
     return c.json({ error: "Repository not found" }, 404);
   }
 
-  const { repo, store } = result;
+  const store = createRepoGitStore(repo);
 
   if (!(await canAccessRepository(repo, currentUser))) {
     return c.json({ error: "Repository not found" }, 404);
@@ -536,12 +492,12 @@ app.get("/api/repositories/:owner/:name/tree", async (c) => {
     return c.json({ error: "Invalid path" }, 400);
   }
 
-  const result = await getRepoAndStore(owner, name);
-  if (!result) {
+  const repo = await resolveRepositoryBySlug(owner, name);
+  if (!repo) {
     return c.json({ error: "Repository not found" }, 404);
   }
 
-  const { repo, store } = result;
+  const store = createRepoGitStore(repo);
 
   if (!(await canAccessRepository(repo, currentUser))) {
     return c.json({ error: "Repository not found" }, 404);
@@ -579,12 +535,12 @@ app.get("/api/repositories/:owner/:name/tree-commits", async (c) => {
     return c.json({ error: "Invalid path" }, 400);
   }
 
-  const result = await getRepoAndStore(owner, name);
-  if (!result) {
+  const repo = await resolveRepositoryBySlug(owner, name);
+  if (!repo) {
     return c.json({ error: "Repository not found" }, 404);
   }
 
-  const { repo, store } = result;
+  const store = createRepoGitStore(repo);
 
   if (!(await canAccessRepository(repo, currentUser))) {
     return c.json({ error: "Repository not found" }, 404);
@@ -612,12 +568,12 @@ app.get("/api/repositories/:owner/:name/file", async (c) => {
     return c.json({ error: "Invalid path" }, 400);
   }
 
-  const result = await getRepoAndStore(owner, name);
-  if (!result) {
+  const repo = await resolveRepositoryBySlug(owner, name);
+  if (!repo) {
     return c.json({ error: "Repository not found" }, 404);
   }
 
-  const { repo, store } = result;
+  const store = createRepoGitStore(repo);
 
   if (!(await canAccessRepository(repo, currentUser))) {
     return c.json({ error: "Repository not found" }, 404);
@@ -641,12 +597,12 @@ app.get("/api/repositories/:owner/:name/readme-oid", async (c) => {
   const currentUser = c.get("user");
   const branch = c.req.query("branch") || "main";
 
-  const result = await getRepoAndStore(owner, name);
-  if (!result) {
+  const repo = await resolveRepositoryBySlug(owner, name);
+  if (!repo) {
     return c.json({ error: "Repository not found" }, 404);
   }
 
-  const { repo, store } = result;
+  const store = createRepoGitStore(repo);
 
   if (!(await canAccessRepository(repo, currentUser))) {
     return c.json({ error: "Repository not found" }, 404);
@@ -679,12 +635,12 @@ app.get("/api/repositories/:owner/:name/readme", async (c) => {
     return c.json({ error: "OID is required" }, 400);
   }
 
-  const result = await getRepoAndStore(owner, name);
-  if (!result) {
+  const repo = await resolveRepositoryBySlug(owner, name);
+  if (!repo) {
     return c.json({ error: "Repository not found" }, 404);
   }
 
-  const { repo, store } = result;
+  const store = createRepoGitStore(repo);
 
   if (!(await canAccessRepository(repo, currentUser))) {
     return c.json({ error: "Repository not found" }, 404);
@@ -778,26 +734,16 @@ app.get("/api/repositories/:owner/:name/page-data", async (c) => {
   const name = c.req.param("name");
   const currentUser = c.get("user");
 
-  const result = await db
-    .select({
-      ownerId: repositories.ownerId,
-      visibility: repositories.visibility,
-    })
-    .from(repositories)
-    .innerJoin(users, eq(users.id, repositories.ownerId))
-    .where(and(eq(users.username, owner), eq(repositories.name, name)))
-    .limit(1);
-
-  const row = result[0];
-  if (!row) {
+  const repo = await resolveRepositoryBySlug(owner, name);
+  if (!repo) {
     return c.json({ error: "Repository not found" }, 404);
   }
 
-  if (!(await canAccessRepository({ id: row.ownerId, ownerId: row.ownerId, visibility: row.visibility }, currentUser))) {
+  if (!(await canAccessRepository(repo, currentUser))) {
     return c.json({ error: "Repository not found" }, 404);
   }
 
-  return c.json({ isOwner: currentUser?.id === row.ownerId });
+  return c.json({ isOwner: currentUser?.id === repo.ownerId });
 });
 
 export default app;

@@ -2,8 +2,9 @@ import { timingSafeEqual } from "crypto";
 import { Hono } from "hono";
 import { EmbedBuilder, WebhookClient } from "discord.js";
 import { config } from "../config";
+import { authMiddleware, requireAdmin, type AuthVariables } from "../middleware/auth";
 
-const app = new Hono();
+const app = new Hono<{ Variables: AuthVariables }>();
 
 const discordWebhookUrl = process.env.DISCORD_WEBHOOK_URL;
 
@@ -207,7 +208,9 @@ async function sendToDiscord(webhookData: DiscordWebhookData) {
 
 function verifyWebhookSecret(provided: string | undefined): boolean {
   const secret = config.discordWebhookSecret;
-  if (!secret) return true;
+  if (!secret) {
+    return !config.isProduction;
+  }
   if (!provided) return false;
   const secretBuf = Buffer.from(secret, "utf8");
   const providedBuf = Buffer.from(provided, "utf8");
@@ -221,6 +224,9 @@ app.post('/api/webhooks/discord', async (c) => {
   }
 
   const secret = config.discordWebhookSecret;
+  if (!secret && config.isProduction) {
+    return c.json({ error: 'Webhook secret not configured' }, 503);
+  }
   if (secret) {
     const provided =
       c.req.header("X-Webhook-Secret") ?? c.req.header("Authorization")?.replace(/^Bearer\s+/i, "").trim();
@@ -244,7 +250,7 @@ app.post('/api/webhooks/discord', async (c) => {
   }
 });
 
-app.get('/api/webhooks/discord/test', async (c) => {
+app.get('/api/webhooks/discord/test', authMiddleware, requireAdmin, async (c) => {
   if (!webhookClient) {
     return c.json({ error: 'Discord webhook not configured' }, 501);
   }

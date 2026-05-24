@@ -1,7 +1,7 @@
 import git from "isomorphic-git";
 import { createS3Fs, type S3Fs } from "./s3-fs";
 import { getRepoPrefix } from "../s3";
-import { getCached, setCache, repoCache, CACHE_TTL } from "../cache";
+import { getCached, setCache, repoCache, CACHE_TTL } from "../redis";
 
 export interface CommitAuthor {
   name: string;

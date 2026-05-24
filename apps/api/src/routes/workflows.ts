@@ -9,7 +9,6 @@ import { triggerWorkflows } from '../workflows/trigger';
 
 const app = new Hono<{ Variables: AuthVariables }>();
 
-app.use('*', authMiddleware);
 
 // ─── Helper ────────────────────────────────────────────────────────────────────
 

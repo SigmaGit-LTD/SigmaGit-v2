@@ -9,7 +9,6 @@ import { createHash } from "crypto";
 
 const app = new Hono<{ Variables: AuthVariables }>();
 
-app.use("*", authMiddleware);
 
 function cacheBustAvatarUrl(avatarUrl: string | null, updatedAt: Date): string | null {
   if (!avatarUrl) return null;
@@ -598,21 +597,32 @@ app.delete("/api/settings/account", requireAuth, async (c) => {
     columns: { name: true },
   });
 
+  const storageErrors: string[] = [];
+
   for (const repo of repos) {
     const repoPrefix = getRepoPrefix(user.id, repo.name);
     try {
       await deletePrefix(repoPrefix);
-    } catch {}
+    } catch (error) {
+      console.error(`[Settings] Failed to delete storage for repo ${repo.name}:`, error);
+      storageErrors.push(repo.name);
+    }
   }
 
   const avatarPrefix = `avatars/${user.id}`;
   try {
     await deletePrefix(avatarPrefix);
-  } catch {}
+  } catch (error) {
+    console.error(`[Settings] Failed to delete avatar storage for user ${user.id}:`, error);
+    storageErrors.push('avatar');
+  }
 
   await db.delete(users).where(eq(users.id, user.id));
 
-  return c.json({ success: true });
+  return c.json({
+    success: true,
+    storageCleanupErrors: storageErrors.length > 0 ? storageErrors : undefined,
+  });
 });
 
 app.get("/api/settings/current-user", requireAuth, async (c) => {

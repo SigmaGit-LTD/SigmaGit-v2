@@ -5,14 +5,33 @@ import { sql } from 'drizzle-orm';
 import { authMiddleware, requireAdmin, type AuthVariables } from '../middleware/auth';
 import { requireRunnerAuth, type RunnerVariables } from '../middleware/runner-auth';
 import { notifyUsers } from '../websocket';
+import { config } from '../config';
 
 type Variables = AuthVariables & RunnerVariables;
 
 const app = new Hono<{ Variables: Variables }>();
 
-// ─── Runner Registration (open in v1) ─────────────────────────────────────────
+function authorizeRunnerRegistration(c: { req: { header: (name: string) => string | undefined }; get: (key: string) => AuthUser | null }): boolean {
+  const secret = config.runnerRegistrationSecret;
+  if (!secret) {
+    return !config.isProduction;
+  }
+  const authHeader = c.req.header('authorization');
+  if (authHeader?.startsWith('Bearer ') && authHeader.slice(7) === secret) {
+    return true;
+  }
+  const user = c.get('user');
+  return user?.role === 'admin';
+}
+
+type AuthUser = AuthVariables['user'];
+
 
 app.post('/api/runners/register', async (c) => {
+  if (!authorizeRunnerRegistration(c)) {
+    return c.json({ error: 'Unauthorized' }, 401);
+  }
+
   const body = await c.req.json().catch(() => ({}));
   const { name, labels, os, arch, version } = body as {
     name?: string;
@@ -60,33 +79,48 @@ app.post('/api/runners/:runnerId/heartbeat', requireRunnerAuth, async (c) => {
     .set({ lastSeenAt: now, updatedAt: now })
     .where(eq(runners.id, runner.id));
 
-  // Find next queued job with no runner assigned
-  const [job] = await db
-    .select({
-      id: workflowJobs.id,
-      runId: workflowJobs.runId,
-      name: workflowJobs.name,
-      workflowDefinition: workflowJobs.workflowDefinition,
-    })
+  // Atomically claim next queued job (conditional update prevents double-assign)
+  const [nextJob] = await db
+    .select({ id: workflowJobs.id })
     .from(workflowJobs)
     .where(and(eq(workflowJobs.status, 'queued'), isNull(workflowJobs.runnerId)))
     .orderBy(asc(workflowJobs.createdAt))
     .limit(1);
 
+  let job: {
+    id: string;
+    runId: string;
+    name: string;
+    workflowDefinition: unknown;
+  } | null = null;
+
+  if (nextJob) {
+    const [claimed] = await db
+      .update(workflowJobs)
+      .set({ runnerId: runner.id, status: 'assigned', startedAt: now })
+      .where(
+        and(
+          eq(workflowJobs.id, nextJob.id),
+          eq(workflowJobs.status, 'queued'),
+          isNull(workflowJobs.runnerId)
+        )
+      )
+      .returning({
+        id: workflowJobs.id,
+        runId: workflowJobs.runId,
+        name: workflowJobs.name,
+        workflowDefinition: workflowJobs.workflowDefinition,
+      });
+    job = claimed ?? null;
+  }
+
   if (!job) {
-    // Mark as online (not busy)
     await db
       .update(runners)
       .set({ status: 'online', currentJobId: null, updatedAt: now })
       .where(eq(runners.id, runner.id));
     return c.json({ job: null });
   }
-
-  // Assign job to this runner
-  await db
-    .update(workflowJobs)
-    .set({ runnerId: runner.id, status: 'assigned', startedAt: now })
-    .where(eq(workflowJobs.id, job.id));
 
   await db
     .update(runners)
@@ -372,7 +406,6 @@ async function finalizeRunIfComplete(runId: string, now: Date) {
 
 // ─── Admin endpoints ───────────────────────────────────────────────────────────
 
-app.use('/api/runners', authMiddleware);
 app.use('/api/runners', requireAdmin);
 
 app.get('/api/runners', async (c) => {

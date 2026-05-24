@@ -5,7 +5,6 @@ import { authMiddleware, requireAuth, type AuthVariables } from "../middleware/a
 
 const app = new Hono<{ Variables: AuthVariables }>();
 
-app.use("*", authMiddleware);
 
 async function getRepoByOwnerName(owner: string, name: string) {
   const result = await db

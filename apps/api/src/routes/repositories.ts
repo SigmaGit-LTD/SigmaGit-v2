@@ -2,12 +2,13 @@ import { Hono } from "hono";
 import { db, users, repositories, stars, repoBranchMetadata, organizations, organizationMembers } from "@sigmagit/db";
 import { eq, sql, desc, and, inArray } from "drizzle-orm";
 import git from "isomorphic-git";
-import { authMiddleware, requireAuth, type AuthVariables } from "../middleware/auth";
+import { requireAuth, type AuthVariables } from "../middleware/auth";
 import { writeRateLimit } from "../middleware/rate-limit";
 import { parseLimit, parseOffset } from "../lib/validation";
 import { canAccessRepository } from "../lib/access";
+import { resolveRepositoryBySlug, getStorageOwnerId } from "../lib/repo-helpers";
 import { putObject, deletePrefix, getRepoPrefix, copyPrefix, listObjects } from "../s3";
-import { repoCache } from "../cache";
+import { repoCache } from "../redis";
 import { createGitStore } from "../git";
 
 const app = new Hono<{ Variables: AuthVariables }>();
@@ -208,8 +209,6 @@ OTHER DEALINGS IN THE SOFTWARE.
 `;
 }
 
-app.use("*", authMiddleware);
-
 async function getForkCount(repoId: string): Promise<number> {
   const [countRow] = await db
     .select({ count: sql<number>`COUNT(*)` })
@@ -380,6 +379,7 @@ app.post("/api/repositories/:owner/:name/fork", requireAuth, writeRateLimit, asy
       name: repositories.name,
       description: repositories.description,
       ownerId: repositories.ownerId,
+      organizationId: repositories.organizationId,
       visibility: repositories.visibility,
       defaultBranch: repositories.defaultBranch,
       createdAt: repositories.createdAt,
@@ -470,7 +470,7 @@ app.post("/api/repositories/:owner/:name/fork", requireAuth, writeRateLimit, asy
     })
     .returning();
 
-  const sourcePrefix = getRepoPrefix(source.ownerId, source.name);
+  const sourcePrefix = getRepoPrefix(getStorageOwnerId(source), source.name);
   const targetPrefix = getRepoPrefix(user.id, targetName);
   await copyPrefix(sourcePrefix, targetPrefix);
 
@@ -699,32 +699,20 @@ app.get("/api/repositories/:owner/:name", async (c) => {
   const name = c.req.param("name");
   const currentUser = c.get("user");
 
-  const result = await db
-    .select({
-      id: repositories.id,
-      name: repositories.name,
-      description: repositories.description,
-      ownerId: repositories.ownerId,
-      visibility: repositories.visibility,
-      defaultBranch: repositories.defaultBranch,
-      createdAt: repositories.createdAt,
-      updatedAt: repositories.updatedAt,
-      forkedFromId: repositories.forkedFromId,
-      username: users.username,
-      userName: users.name,
-      avatarUrl: users.avatarUrl,
-    })
-    .from(repositories)
-    .innerJoin(users, eq(users.id, repositories.ownerId))
-    .where(and(eq(users.username, owner), eq(repositories.name, name)))
-    .limit(1);
-
-  const row = result[0];
-  if (!row) {
+  const resolved = await resolveRepositoryBySlug(owner, name);
+  if (!resolved) {
     return c.json({ error: "Repository not found" }, 404);
   }
 
-  if (!(await canAccessRepository({ id: row.id, ownerId: row.ownerId, visibility: row.visibility }, currentUser))) {
+  if (!(await canAccessRepository(resolved, currentUser))) {
+    return c.json({ error: "Repository not found" }, 404);
+  }
+
+  const row = await db.query.repositories.findFirst({
+    where: eq(repositories.id, resolved.id),
+  });
+
+  if (!row) {
     return c.json({ error: "Repository not found" }, 404);
   }
 
@@ -736,6 +724,21 @@ app.get("/api/repositories/:owner/:name", async (c) => {
   const forkedFrom = await getForkedFromInfo(row.forkedFromId, currentUser?.id);
   const forkCount = await getForkCount(row.id);
 
+  let avatarUrl: string | null = null;
+  if (resolved.ownerType === "org" && resolved.organizationId) {
+    const org = await db.query.organizations.findFirst({
+      where: eq(organizations.id, resolved.organizationId),
+      columns: { avatarUrl: true },
+    });
+    avatarUrl = org?.avatarUrl ?? null;
+  } else {
+    const ownerUser = await db.query.users.findFirst({
+      where: eq(users.id, resolved.ownerId),
+      columns: { avatarUrl: true },
+    });
+    avatarUrl = ownerUser?.avatarUrl ?? null;
+  }
+
   return c.json({
     id: row.id,
     name: row.name,
@@ -745,10 +748,10 @@ app.get("/api/repositories/:owner/:name", async (c) => {
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
     owner: {
-      id: row.ownerId,
-      username: row.username,
-      name: row.userName,
-      avatarUrl: row.avatarUrl,
+      id: resolved.ownerType === "org" ? resolved.organizationId! : resolved.ownerId,
+      username: resolved.ownerSlug,
+      name: resolved.ownerDisplay,
+      avatarUrl,
     },
     starCount: Number(starCount?.count) || 0,
     forkedFrom,

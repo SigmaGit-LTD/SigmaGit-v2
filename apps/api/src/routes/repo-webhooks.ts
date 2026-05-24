@@ -9,7 +9,6 @@ export type WebhookEvent = "push" | "pull_request" | "issues" | "tag" | "branch"
 
 const app = new Hono<{ Variables: AuthVariables }>();
 
-app.use("*", authMiddleware);
 
 async function getRepoByOwnerName(owner: string, name: string) {
   const result = await db

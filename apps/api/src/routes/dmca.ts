@@ -11,7 +11,6 @@ function isDmcaTargetType(value: unknown): value is DmcaTargetType {
 
 const app = new Hono<{ Variables: AuthVariables }>();
 
-app.use("*", authMiddleware);
 
 app.post("/api/dmca", async (c) => {
   const user = c.get("user");

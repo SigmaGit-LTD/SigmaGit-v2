@@ -7,6 +7,7 @@
 import { db, repositories, users, workflows } from '@sigmagit/db';
 import { and, eq, notInArray } from 'drizzle-orm';
 import { createGitStore, getTree, getBlobByOid } from '../git';
+import { getStorageOwnerId } from '../lib/repo-helpers';
 
 const WORKFLOW_DIRS = ['.sigmagit/workflows', '.github/workflows'];
 
@@ -98,7 +99,12 @@ export async function syncWorkflows(repoId: string): Promise<void> {
   try {
     // Get repository info
     const [repo] = await db
-      .select({ ownerId: repositories.ownerId, name: repositories.name, defaultBranch: repositories.defaultBranch })
+      .select({
+        ownerId: repositories.ownerId,
+        organizationId: repositories.organizationId,
+        name: repositories.name,
+        defaultBranch: repositories.defaultBranch,
+      })
       .from(repositories)
       .where(eq(repositories.id, repoId))
       .limit(1);
@@ -113,7 +119,8 @@ export async function syncWorkflows(repoId: string): Promise<void> {
 
     if (!owner) return;
 
-    const { fs, dir } = createGitStore(repo.ownerId, repo.name);
+    const storageOwnerId = getStorageOwnerId(repo);
+    const { fs, dir } = createGitStore(storageOwnerId, repo.name);
 
     const foundWorkflows: Array<{ path: string; name: string; content: string; triggers: WorkflowTriggers }> = [];
 

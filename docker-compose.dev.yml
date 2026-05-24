@@ -1,0 +1,16 @@
+services:
+  postgres:
+    ports:
+      - '5432:5432'
+
+  redis:
+    ports:
+      - '6379:6379'
+
+  api:
+    ports:
+      - '3001:3001'
+
+  web:
+    ports:
+      - '3000:3000'

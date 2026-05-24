@@ -9,7 +9,8 @@ import { getAuth } from "../auth";
 import { putObject, deleteObject, getObject } from "../s3";
 import { createHash } from "crypto";
 import { deflate, inflate, inflateWithConsumedBytes } from "../lib/async-zlib";
-import { GIT_MAX_OBJECTS_PER_PUSH, GIT_MAX_DELTA_DEPTH, GIT_MAX_UPLOAD_PACK_OBJECTS, GIT_MAX_OBJECT_BYTES, forceGCIfNeeded, measureMemory } from "../middleware/limits";
+import { GIT_MAX_OBJECTS_PER_PUSH, GIT_MAX_DELTA_DEPTH, GIT_MAX_UPLOAD_PACK_OBJECTS, GIT_MAX_OBJECT_BYTES, GIT_PUSH_SIZE_LIMIT, forceGCIfNeeded, measureMemory } from "../middleware/limits";
+import { readRequestBodyLimited, RequestBodyTooLargeError } from "../lib/request-body";
 import { triggerWorkflows } from "../workflows/trigger";
 import { syncWorkflows } from "../workflows/sync";
 
@@ -246,8 +247,21 @@ app.post("/:owner/:name/git-upload-pack", async (c) => {
   }
 
   try {
-    const body = await c.req.arrayBuffer();
-    const requestData = Buffer.from(body);
+    let requestData: Buffer;
+    try {
+      requestData = await readRequestBodyLimited(c.req.raw, GIT_PUSH_SIZE_LIMIT);
+    } catch (error) {
+      if (error instanceof RequestBodyTooLargeError) {
+        return new Response("0008NAK\n", {
+          status: 200,
+          headers: {
+            "Content-Type": "application/x-git-upload-pack-result",
+            "Cache-Control": "no-cache",
+          },
+        });
+      }
+      throw error;
+    }
     const uploadRequest = parseUploadPackRequest(requestData);
 
     if (uploadRequest.wants.length === 0) {
@@ -968,21 +982,24 @@ app.post("/:owner/:name/git-receive-pack", async (c) => {
   const contentLength = c.req.header('content-length');
   if (contentLength) {
     const size = parseInt(contentLength, 10);
-    if (size > GIT_MAX_OBJECTS_PER_PUSH * 1024) {
+    if (size > GIT_PUSH_SIZE_LIMIT) {
       console.warn(`[API] receive-pack: request size ${size} too large`);
       return c.json({ error: "Request too large" }, 413);
     }
   }
 
   console.log(`[API] receive-pack: received request for ${owner}/${name}`);
-  const body = await c.req.arrayBuffer();
-  const requestData = Buffer.from(body);
-  console.log(`[API] receive-pack: received ${requestData.length} bytes`);
-
-  if (requestData.length > GIT_MAX_OBJECTS_PER_PUSH * 1024) {
-    console.warn(`[API] receive-pack: pack size ${requestData.length} too large`);
-    return c.json({ error: "Pack file too large" }, 413);
+  let requestData: Buffer;
+  try {
+    requestData = await readRequestBodyLimited(c.req.raw, GIT_PUSH_SIZE_LIMIT);
+  } catch (error) {
+    if (error instanceof RequestBodyTooLargeError) {
+      console.warn(`[API] receive-pack: pack size ${error.receivedBytes} too large`);
+      return c.json({ error: "Pack file too large" }, 413);
+    }
+    throw error;
   }
+  console.log(`[API] receive-pack: received ${requestData.length} bytes`);
 
   try {
 

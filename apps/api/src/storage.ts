@@ -9,7 +9,7 @@ import {
   ListObjectsV2Command,
   HeadObjectCommand,
 } from '@aws-sdk/client-s3';
-import { withTimeout } from './middleware/limits';
+import { withTimeout, MAX_LOCAL_LIST_KEYS } from './middleware/limits';
 
 export type StorageType = 's3' | 'local';
 
@@ -376,6 +376,19 @@ class LocalStorageBackend implements StorageBackend {
     }
   }
 
+  private async *walkLocalKeys(fullPath: string, prefix: string): AsyncGenerator<string> {
+    const entries = await readdir(fullPath, { withFileTypes: true });
+    for (const entry of entries) {
+      const entryPath = join(fullPath, entry.name);
+      const key = prefix ? `${prefix}/${entry.name}` : entry.name;
+      if (entry.isDirectory()) {
+        yield* this.walkLocalKeys(entryPath, key);
+      } else if (entry.isFile()) {
+        yield key;
+      }
+    }
+  }
+
   async list(prefix: string): Promise<string[]> {
     await this.ensureBasePath();
     const fullPath = this.getFullPath(prefix);
@@ -390,11 +403,12 @@ class LocalStorageBackend implements StorageBackend {
     }
 
     const keys: string[] = [];
-    const files = await readdir(fullPath, { recursive: true });
-
-    for (const file of files) {
-      const relativePath = join(prefix, file);
-      keys.push(relativePath);
+    for await (const key of this.walkLocalKeys(fullPath, prefix.replace(/\/$/, ''))) {
+      keys.push(key);
+      if (keys.length >= MAX_LOCAL_LIST_KEYS) {
+        console.warn(`[Storage] local list truncated at ${MAX_LOCAL_LIST_KEYS} keys for prefix ${prefix}`);
+        break;
+      }
     }
 
     return keys;
@@ -417,28 +431,47 @@ class LocalStorageBackend implements StorageBackend {
   }
 
   async copyPrefix(sourcePrefix: string, targetPrefix: string): Promise<void> {
-    const keys = await this.list(sourcePrefix);
+    await this.ensureBasePath();
+    const sourcePath = this.getFullPath(sourcePrefix);
+
+    try {
+      await stat(sourcePath);
+    } catch (error: any) {
+      if (error.code === 'ENOENT') {
+        return;
+      }
+      throw error;
+    }
+
+    const normalizedSource = sourcePrefix.replace(/\/$/, '');
+    const normalizedTarget = targetPrefix.replace(/\/$/, '');
     const BATCH_SIZE = 20;
+    let batch: Array<{ sourceKey: string; targetKey: string }> = [];
 
-    for (let i = 0; i < keys.length; i += BATCH_SIZE) {
-      const batch = keys.slice(i, i + BATCH_SIZE);
-
+    const flushBatch = async () => {
+      if (batch.length === 0) return;
+      const current = batch;
+      batch = [];
       await Promise.all(
-        batch.map(async (key) => {
-          const data = await this.get(key);
-          if (!data) {
-            return;
+        current.map(async ({ sourceKey, targetKey }) => {
+          const data = await this.get(sourceKey);
+          if (data) {
+            await this.put(targetKey, data);
           }
-          const suffix = key.slice(sourcePrefix.length);
-          const targetKey = `${targetPrefix}${suffix}`;
-          await this.put(targetKey, data);
         })
       );
+    };
 
-      if ((i / BATCH_SIZE) % 10 === 0) {
-        await new Promise(resolve => setTimeout(resolve, 0));
+    for await (const sourceKey of this.walkLocalKeys(sourcePath, normalizedSource)) {
+      const suffix = sourceKey.slice(normalizedSource.length);
+      const targetKey = `${normalizedTarget}${suffix}`;
+      batch.push({ sourceKey, targetKey });
+      if (batch.length >= BATCH_SIZE) {
+        await flushBatch();
       }
     }
+
+    await flushBatch();
   }
 
   async getStream(key: string): Promise<ReadableStream | null> {

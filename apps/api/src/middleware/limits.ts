@@ -15,7 +15,13 @@ export const GIT_MAX_DELTA_DEPTH = 100;
 export const GIT_MAX_OBJECT_BYTES = 10 * 1024 * 1024; // 10MB per object in pack
 export const MAX_FILE_CACHE_BYTES = 256 * 1024; // 256KB — skip Redis cache above this
 export const MAX_FILE_SERVE_BYTES = 1024 * 1024; // 1MB — refuse to load larger blobs as text
-export const MAX_COMPRESS_BYTES = 256 * 1024; // 256KB — skip gzip above this
+export const MAX_COMPRESS_BYTES = 256 * 1024; // skip gzip when Content-Length exceeds this
+export const MAX_DIFF_FILES = 100;
+export const MAX_DIFF_FILE_BYTES = 512 * 1024; // 512KB inflated text per file
+export const MAX_DIFF_LINES = 5000; // max lines diffed per file
+export const REGISTRY_MAX_CHUNK_BYTES = 50 * 1024 * 1024; // 50MB per upload chunk
+export const REGISTRY_MAX_BLOB_BYTES = 512 * 1024 * 1024; // 512MB total blob
+export const MAX_LOCAL_LIST_KEYS = 10_000;
 
 export function shouldRejectRequest(): boolean {
   try {

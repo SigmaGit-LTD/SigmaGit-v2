@@ -2,7 +2,7 @@ import git from "isomorphic-git";
 import { createS3Fs, type S3Fs } from "./s3-fs";
 import { getRepoPrefix } from "../s3";
 import { getCached, setCache, repoCache, CACHE_TTL } from "../redis";
-import { MAX_FILE_CACHE_BYTES, MAX_FILE_SERVE_BYTES } from "../middleware/limits";
+import { MAX_FILE_CACHE_BYTES, MAX_FILE_SERVE_BYTES, MAX_DIFF_FILES, MAX_DIFF_FILE_BYTES, MAX_DIFF_LINES } from "../middleware/limits";
 
 export interface CommitAuthor {
   name: string;
@@ -49,6 +49,8 @@ export interface FileDiff {
   additions: number;
   deletions: number;
   hunks: DiffHunk[];
+  truncated?: boolean;
+  binary?: boolean;
 }
 
 export interface CommitDiff {
@@ -59,6 +61,7 @@ export interface CommitDiff {
     additions: number;
     deletions: number;
     filesChanged: number;
+    truncatedFiles?: number;
   };
 }
 
@@ -554,58 +557,128 @@ async function compareTreesRecursive(
   return results;
 }
 
+async function getBlobInflatedSizeEstimate(fs: S3Fs, dir: string, oid: string): Promise<number | null> {
+  try {
+    const objectPath = `${dir}/objects/${oid.slice(0, 2)}/${oid.slice(2)}`;
+    const stats = await fs.promises.stat(objectPath);
+    return stats.size * 8;
+  } catch {
+    try {
+      const { blob } = await git.readBlob({ fs, dir, oid });
+      return blob.length;
+    } catch {
+      return null;
+    }
+  }
+}
+
+async function readBlobTextLimited(
+  fs: S3Fs,
+  dir: string,
+  oid: string
+): Promise<{ content: string; binary: boolean } | null> {
+  const sizeEstimate = await getBlobInflatedSizeEstimate(fs, dir, oid);
+  if (sizeEstimate != null && sizeEstimate > MAX_DIFF_FILE_BYTES) {
+    return null;
+  }
+
+  const { blob } = await git.readBlob({ fs, dir, oid });
+  if (blob.length > MAX_DIFF_FILE_BYTES) {
+    return null;
+  }
+
+  const content = new TextDecoder().decode(blob);
+  const binary = content.includes('\0');
+  return { content, binary };
+}
+
+function capDiffLines(lines: string[]): string[] {
+  if (lines.length <= MAX_DIFF_LINES) {
+    return lines;
+  }
+  return lines.slice(0, MAX_DIFF_LINES);
+}
+
 async function generateDiffHunks(
   fs: S3Fs,
   dir: string,
   oldOid: string | null,
   newOid: string | null,
   status: string
-): Promise<DiffHunk[]> {
+): Promise<{ hunks: DiffHunk[]; truncated: boolean; binary: boolean }> {
   try {
     let oldContent = "";
     let newContent = "";
+    let binary = false;
+    let truncated = false;
 
     if (oldOid) {
-      const { blob } = await git.readBlob({ fs, dir, oid: oldOid });
-      oldContent = new TextDecoder().decode(blob);
+      const oldBlob = await readBlobTextLimited(fs, dir, oldOid);
+      if (!oldBlob) {
+        return { hunks: [], truncated: true, binary: false };
+      }
+      if (oldBlob.binary) binary = true;
+      oldContent = oldBlob.content;
     }
 
     if (newOid) {
-      const { blob } = await git.readBlob({ fs, dir, oid: newOid });
-      newContent = new TextDecoder().decode(blob);
+      const newBlob = await readBlobTextLimited(fs, dir, newOid);
+      if (!newBlob) {
+        return { hunks: [], truncated: true, binary: binary || false };
+      }
+      if (newBlob.binary) binary = true;
+      newContent = newBlob.content;
     }
 
-    const oldLines = oldContent ? oldContent.split("\n") : [];
-    const newLines = newContent ? newContent.split("\n") : [];
+    if (binary) {
+      return { hunks: [], truncated: false, binary: true };
+    }
+
+    const oldLines = capDiffLines(oldContent ? oldContent.split("\n") : []);
+    const newLines = capDiffLines(newContent ? newContent.split("\n") : []);
+    if (
+      (oldContent && oldContent.split("\n").length > MAX_DIFF_LINES) ||
+      (newContent && newContent.split("\n").length > MAX_DIFF_LINES)
+    ) {
+      truncated = true;
+    }
 
     if (status === "added") {
-      if (newLines.length === 0) return [];
-      return [{
-        oldStart: 0,
-        oldLines: 0,
-        newStart: 1,
-        newLines: newLines.length,
-        lines: newLines.map((content, i) => ({
-          type: "addition" as const,
-          content,
-          newLineNumber: i + 1,
-        })),
-      }];
+      if (newLines.length === 0) return { hunks: [], truncated, binary: false };
+      return {
+        truncated,
+        binary: false,
+        hunks: [{
+          oldStart: 0,
+          oldLines: 0,
+          newStart: 1,
+          newLines: newLines.length,
+          lines: newLines.map((content, i) => ({
+            type: "addition" as const,
+            content,
+            newLineNumber: i + 1,
+          })),
+        }],
+      };
     }
 
     if (status === "deleted") {
-      if (oldLines.length === 0) return [];
-      return [{
-        oldStart: 1,
-        oldLines: oldLines.length,
-        newStart: 0,
-        newLines: 0,
-        lines: oldLines.map((content, i) => ({
-          type: "deletion" as const,
-          content,
-          oldLineNumber: i + 1,
-        })),
-      }];
+      if (oldLines.length === 0) return { hunks: [], truncated, binary: false };
+      return {
+        truncated,
+        binary: false,
+        hunks: [{
+          oldStart: 1,
+          oldLines: oldLines.length,
+          newStart: 0,
+          newLines: 0,
+          lines: oldLines.map((content, i) => ({
+            type: "deletion" as const,
+            content,
+            oldLineNumber: i + 1,
+          })),
+        }],
+      };
     }
 
     const hunks: DiffHunk[] = [];
@@ -646,11 +719,68 @@ async function generateDiffHunks(
       if (currentHunk) hunks.push(currentHunk);
     }
 
-    return hunks;
+    return { hunks, truncated, binary: false };
   } catch (e) {
     console.error(`[Git] generateDiffHunks error:`, e);
-    return [];
+    return { hunks: [], truncated: false, binary: false };
   }
+}
+
+async function buildFileDiff(
+  fs: S3Fs,
+  dir: string,
+  file: { path: string; status: string; oldOid: string | null; newOid: string | null }
+): Promise<FileDiff> {
+  const result = await generateDiffHunks(fs, dir, file.oldOid, file.newOid, file.status);
+  let additionCount = 0;
+  let deletionCount = 0;
+  for (const hunk of result.hunks) {
+    for (const line of hunk.lines) {
+      if (line.type === "addition") additionCount++;
+      if (line.type === "deletion") deletionCount++;
+    }
+  }
+
+  return {
+    path: file.path,
+    status: file.status as FileDiff["status"],
+    additions: additionCount,
+    deletions: deletionCount,
+    hunks: result.hunks,
+    ...(result.truncated ? { truncated: true } : {}),
+    ...(result.binary ? { binary: true } : {}),
+  };
+}
+
+async function processChangedFiles(
+  fs: S3Fs,
+  dir: string,
+  changedFiles: Array<{ path: string; status: string; oldOid: string | null; newOid: string | null }>
+): Promise<{
+  files: FileDiff[];
+  stats: { additions: number; deletions: number; filesChanged: number; truncatedFiles?: number };
+}> {
+  const files: FileDiff[] = [];
+  let additions = 0;
+  let deletions = 0;
+  const truncatedFiles = Math.max(0, changedFiles.length - MAX_DIFF_FILES);
+
+  for (const file of changedFiles.slice(0, MAX_DIFF_FILES)) {
+    const fileDiff = await buildFileDiff(fs, dir, file);
+    additions += fileDiff.additions;
+    deletions += fileDiff.deletions;
+    files.push(fileDiff);
+  }
+
+  return {
+    files,
+    stats: {
+      additions,
+      deletions,
+      filesChanged: changedFiles.length,
+      ...(truncatedFiles > 0 ? { truncatedFiles } : {}),
+    },
+  };
 }
 
 interface DiffChange {
@@ -767,32 +897,17 @@ export async function getCommitDiff(
 
 
       const changedFiles = await compareTreesRecursive(fs, dir, parentTree, currentTree, "");
+      const processed = await processChangedFiles(fs, dir, changedFiles);
+      files.push(...processed.files);
+      additions = processed.stats.additions;
+      deletions = processed.stats.deletions;
 
-      for (const file of changedFiles) {
-        const hunks = await generateDiffHunks(fs, dir, file.oldOid, file.newOid, file.status);
-
-        let additionCount = 0;
-        let deletionCount = 0;
-        for (const hunk of hunks) {
-          for (const line of hunk.lines) {
-            if (line.type === "addition") additionCount++;
-            if (line.type === "deletion") deletionCount++;
-          }
-        }
-
-        additions += additionCount;
-        deletions += deletionCount;
-
-        files.push({
-          path: file.path,
-          status: file.status as "added" | "modified" | "deleted" | "renamed",
-          additions: additionCount,
-          deletions: deletionCount,
-          hunks,
-        });
-      }
-
-
+      return {
+        commit: commitInfo,
+        parent: parentOid,
+        files,
+        stats: processed.stats,
+      };
     } catch (walkError) {
       console.error(`[Git] getCommitDiff walk error:`, walkError);
     }
@@ -968,6 +1083,7 @@ export interface BranchComparison {
     additions: number;
     deletions: number;
     filesChanged: number;
+    truncatedFiles?: number;
   };
   ahead: number;
   behind: number;
@@ -1128,31 +1244,9 @@ export async function compareBranches(
           ""
         );
 
-        for (const file of changedFiles) {
-          const hunks = await generateDiffHunks(headStore.fs, headStore.dir, file.oldOid, file.newOid, file.status);
-
-          let additionCount = 0;
-          let deletionCount = 0;
-          for (const hunk of hunks) {
-            for (const line of hunk.lines) {
-              if (line.type === "addition") additionCount++;
-              if (line.type === "deletion") deletionCount++;
-            }
-          }
-
-          stats.additions += additionCount;
-          stats.deletions += deletionCount;
-
-          files.push({
-            path: file.path,
-            status: file.status as "added" | "modified" | "deleted" | "renamed",
-            additions: additionCount,
-            deletions: deletionCount,
-            hunks,
-          });
-        }
-
-        stats.filesChanged = files.length;
+        const processed = await processChangedFiles(headStore.fs, headStore.dir, changedFiles);
+        files = processed.files;
+        stats = processed.stats;
       }
     } else if (headCommitOids.length > 0) {
       const diff = await getCommitDiff(headStore.fs, headStore.dir, headOid);

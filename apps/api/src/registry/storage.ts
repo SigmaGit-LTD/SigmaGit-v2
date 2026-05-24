@@ -17,6 +17,7 @@ import {
   getObjectStream,
   deletePrefix,
 } from "../storage";
+import { REGISTRY_MAX_BLOB_BYTES } from "../middleware/limits";
 
 const REGISTRY_PREFIX = "registry/";
 const UPLOADS_PREFIX = "registry/_uploads/";
@@ -33,7 +34,6 @@ type ChunkedBlobIndex = {
 };
 
 export function getRegistryBlobKey(owner: string, imageName: string, digest: string): string {
-  // digest format: "sha256:hex" or "sha512:hex"
   const normalized = digest.replace(":", "/");
   return `${REGISTRY_PREFIX}${owner}/${imageName}/blobs/${normalized}`;
 }
@@ -129,7 +129,6 @@ async function writeChunkedBlobIndex(
     size: total,
   };
 
-  // Marker object so blob existence checks remain simple.
   await putObject(getRegistryBlobKey(owner, imageName, digest), Buffer.alloc(0));
   await putObject(
     getRegistryBlobChunkIndexKey(owner, imageName, digest),
@@ -169,7 +168,6 @@ export async function listManifestRefs(owner: string, imageName: string): Promis
   return keys
     .map((k) => k.slice(prefix.length))
     .filter(Boolean)
-    // Keep tags list output aligned with OCI behavior: exclude digest refs.
     .filter((ref) => !/^sha[0-9]+:[a-f0-9]+$/i.test(ref));
 }
 
@@ -184,6 +182,10 @@ export async function getUploadSize(uuid: string): Promise<number> {
 
 export async function appendUploadChunk(uuid: string, chunk: Buffer): Promise<{ size: number }> {
   const index = await readUploadIndex(uuid);
+  if (index.size + chunk.length > REGISTRY_MAX_BLOB_BYTES) {
+    throw new Error("Upload exceeds maximum blob size");
+  }
+
   const chunkKey = getUploadChunkKey(uuid, index.chunks.length);
   await putObject(chunkKey, chunk);
   const updated: UploadIndex = {
@@ -200,25 +202,54 @@ export async function finalizeUpload(
   uuid: string,
   digest: string,
   trailingChunk?: Buffer,
-): Promise<{ ok: true } | { ok: false; reason: "missing" | "digest_mismatch" }> {
+): Promise<{ ok: true } | { ok: false; reason: "missing" | "digest_mismatch" | "too_large" }> {
   const index = await readUploadIndex(uuid);
   const hasChunks = index.chunks.length > 0;
   const hasTrailing = Boolean(trailingChunk && trailingChunk.length > 0);
+  const totalSize = index.size + (trailingChunk?.length ?? 0);
 
   if (!hasChunks && !hasTrailing) {
     return { ok: false, reason: "missing" };
   }
 
+  if (totalSize > REGISTRY_MAX_BLOB_BYTES) {
+    return { ok: false, reason: "too_large" };
+  }
+
   const hash = createHash("sha256");
 
-  for (const key of index.chunks) {
-    const chunk = await getObject(key);
+  if (!hasChunks && hasTrailing && trailingChunk) {
+    hash.update(trailingChunk);
+    const computed = `sha256:${hash.digest("hex")}`;
+    if (computed !== digest) {
+      return { ok: false, reason: "digest_mismatch" };
+    }
+    await putBlob(owner, imageName, digest, trailingChunk);
+    await deleteUpload(uuid);
+    return { ok: true };
+  }
+
+  const chunkKeys: string[] = [];
+  let total = 0;
+  let nextIndex = 0;
+
+  for (const uploadChunkKey of index.chunks) {
+    const chunk = await getObject(uploadChunkKey);
     if (!chunk) return { ok: false, reason: "missing" };
     hash.update(chunk);
+
+    const targetKey = getRegistryBlobChunkKey(owner, imageName, digest, nextIndex++);
+    await putObject(targetKey, chunk);
+    chunkKeys.push(targetKey);
+    total += chunk.length;
   }
 
   if (hasTrailing && trailingChunk) {
     hash.update(trailingChunk);
+    const targetKey = getRegistryBlobChunkKey(owner, imageName, digest, nextIndex);
+    await putObject(targetKey, trailingChunk);
+    chunkKeys.push(targetKey);
+    total += trailingChunk.length;
   }
 
   const computed = `sha256:${hash.digest("hex")}`;
@@ -226,38 +257,29 @@ export async function finalizeUpload(
     return { ok: false, reason: "digest_mismatch" };
   }
 
-  if (!hasChunks && hasTrailing && trailingChunk) {
-    await putBlob(owner, imageName, digest, trailingChunk);
-  } else {
-    const chunkKeys: string[] = [];
-    let total = 0;
-    let nextIndex = 0;
-
-    for (const key of index.chunks) {
-      const chunk = await getObject(key);
-      if (!chunk) return { ok: false, reason: "missing" };
-      const targetKey = getRegistryBlobChunkKey(owner, imageName, digest, nextIndex++);
-      await putObject(targetKey, chunk);
-      chunkKeys.push(targetKey);
-      total += chunk.length;
-    }
-
-    if (hasTrailing && trailingChunk) {
-      const targetKey = getRegistryBlobChunkKey(owner, imageName, digest, nextIndex);
-      await putObject(targetKey, trailingChunk);
-      chunkKeys.push(targetKey);
-      total += trailingChunk.length;
-    }
-
-    await writeChunkedBlobIndex(owner, imageName, digest, chunkKeys, total);
-  }
-
+  await writeChunkedBlobIndex(owner, imageName, digest, chunkKeys, total);
   await deleteUpload(uuid);
   return { ok: true };
 }
 
 export async function deleteUpload(uuid: string): Promise<void> {
   await deletePrefix(getUploadPrefix(uuid));
+}
+
+async function pipeStreamToController(
+  stream: ReadableStream<Uint8Array>,
+  controller: ReadableStreamDefaultController<Uint8Array>
+): Promise<void> {
+  const reader = stream.getReader();
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      controller.enqueue(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
 }
 
 export async function streamBlob(owner: string, imageName: string, digest: string): Promise<ReadableStream | null> {
@@ -271,11 +293,11 @@ export async function streamBlob(owner: string, imageName: string, digest: strin
     async start(controller) {
       try {
         for (const key of chunked.chunks) {
-          const chunk = await getObject(key);
-          if (!chunk) {
+          const chunkStream = await getObjectStream(key);
+          if (!chunkStream) {
             throw new Error("Missing blob chunk");
           }
-          controller.enqueue(chunk);
+          await pipeStreamToController(chunkStream, controller);
         }
         controller.close();
       } catch (error) {

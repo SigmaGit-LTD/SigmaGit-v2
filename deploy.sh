@@ -6,7 +6,7 @@ set -e
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
-NC='\033[0m' # No Color
+NC='\033[0m'
 
 # Configuration variables
 DEPLOY_USER="sigmagit"
@@ -16,23 +16,22 @@ STORAGE_DIR="$DEPLOY_DIR/sigmagit-storage"
 LOGS_DIR="$DEPLOY_DIR/logs"
 BACKUP_DIR="$DEPLOY_DIR/backups"
 SCRIPTS_DIR="$DEPLOY_DIR/scripts"
-DB_NAME="sigmagit"
-DB_USER="sigmagit"
+COMPOSE_FILES="-f docker-compose.yml -f docker-compose.prod.yml"
+
 WEB_DOMAIN=""
-API_DOMAIN=""
+DOCS_DOMAIN=""
 GIT_REPO=""
-DB_PASSWORD=""
+POSTGRES_PASSWORD=""
+BETTER_AUTH_SECRET=""
 RESEND_API_KEY=""
 SMTP_HOST=""
 SMTP_PORT=""
 SMTP_USER=""
 SMTP_PASSWORD=""
-BETTER_AUTH_SECRET=""
 DISCORD_BOT_TOKEN=""
-DISCORD_BOT_CLIENT_ID=""
-DISCORD_WEBHOOK_SECRET=""
+DISCORD_CLIENT_ID=""
+ENABLE_DISCORD="false"
 
-# Helper functions
 log_info() {
   echo -e "${GREEN}[INFO]${NC} $1"
 }
@@ -53,37 +52,41 @@ check_root() {
 }
 
 check_ubuntu_debian() {
-  if ! command -v apt-get &> /dev/null; then
+  if ! command -v apt-get &>/dev/null; then
     log_error "This script is designed for Ubuntu/Debian systems only"
     exit 1
   fi
+}
+
+compose_cmd() {
+  su - "$DEPLOY_USER" -c "cd $APP_DIR && docker compose $COMPOSE_FILES $*"
 }
 
 prompt_input() {
   local prompt_text="$1"
   local default_value="$2"
   local var_name="$3"
-  
+
   if [ -n "$default_value" ]; then
     read -p "$prompt_text [$default_value]: " input
     input=${input:-$default_value}
   else
     read -p "$prompt_text: " input
   fi
-  
+
   eval "$var_name='$input'"
 }
 
 prompt_password() {
   local prompt_text="$1"
   local var_name="$2"
-  
+
   while true; do
     read -s -p "$prompt_text: " input1
     echo
     read -s -p "Confirm $prompt_text: " input2
     echo
-    
+
     if [ "$input1" == "$input2" ]; then
       eval "$var_name='$input1'"
       break
@@ -95,153 +98,48 @@ prompt_password() {
 
 update_system() {
   log_info "Updating system packages..."
-  apt update && apt upgrade -y
+  apt-get update && apt-get upgrade -y
 }
 
 create_user() {
   log_info "Creating deployment user..."
-  
+
   if id "$DEPLOY_USER" &>/dev/null; then
     log_warn "User $DEPLOY_USER already exists. Skipping..."
   else
     adduser --gecos "" --disabled-password "$DEPLOY_USER"
     usermod -aG sudo "$DEPLOY_USER"
-    
-    # Set up passwordless sudo for specific commands
-    echo "$DEPLOY_USER ALL=(ALL) NOPASSWD:/usr/sbin/service, /bin/systemctl" > /etc/sudoers.d/$DEPLOY_USER
+    echo "$DEPLOY_USER ALL=(ALL) NOPASSWD:/usr/bin/docker, /usr/bin/docker compose, /usr/bin/systemctl" > /etc/sudoers.d/$DEPLOY_USER
     chmod 440 /etc/sudoers.d/$DEPLOY_USER
-    
     log_info "User $DEPLOY_USER created successfully"
   fi
-  
-  # Create necessary directories
-  mkdir -p "$LOGS_DIR"
-  mkdir -p "$BACKUP_DIR"
-  mkdir -p "$SCRIPTS_DIR"
-  mkdir -p "$STORAGE_DIR"
+
+  mkdir -p "$LOGS_DIR" "$BACKUP_DIR" "$SCRIPTS_DIR" "$STORAGE_DIR"
   chown -R "$DEPLOY_USER:$DEPLOY_USER" "$DEPLOY_DIR"
 }
 
-install_bun() {
-  log_info "Installing Bun..."
-  
-  if command -v bun &> /dev/null; then
-    log_warn "Bun is already installed. Skipping..."
-    bun upgrade
-  else
-    su - "$DEPLOY_USER" -c 'curl -fsSL https://bun.sh/install | bash'
-    
-    # Add Bun to PATH for the user
-    echo 'export BUN_INSTALL="$HOME/.bun"' >> "$DEPLOY_DIR/.bashrc"
-    echo 'export PATH="$BUN_INSTALL/bin:$PATH"' >> "$DEPLOY_DIR/.bashrc"
-    
-    log_info "Bun installed successfully"
-  fi
-  
-  # Verify installation
-  su - "$DEPLOY_USER" -c 'bun --version'
-}
+install_docker() {
+  log_info "Installing Docker and Docker Compose..."
 
-install_postgresql() {
-  log_info "Installing PostgreSQL..."
-  
-  if command -v psql &> /dev/null; then
-    log_warn "PostgreSQL is already installed. Skipping..."
+  if command -v docker &>/dev/null && docker compose version &>/dev/null; then
+    log_warn "Docker is already installed. Skipping..."
   else
-    apt install postgresql postgresql-contrib -y
-    systemctl start postgresql
-    systemctl enable postgresql
-    log_info "PostgreSQL installed successfully"
+    curl -fsSL https://get.docker.com | sh
+    log_info "Docker installed successfully"
   fi
-}
 
-setup_database() {
-  log_info "Setting up database..."
-  
-  # Create database and user
-  sudo -u postgres psql << EOF
-SELECT 'CREATE DATABASE $DB_NAME' WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = '$DB_NAME')\gexec
-DO
-\$do\$
-BEGIN
-   IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = '$DB_USER') THEN
-      CREATE ROLE $DB_USER LOGIN PASSWORD '$DB_PASSWORD';
-   END IF
-END
-\$do\$;
-GRANT ALL PRIVILEGES ON DATABASE $DB_NAME TO $DB_USER;
-EOF
-  
-  log_info "Database and user created successfully"
-}
+  usermod -aG docker "$DEPLOY_USER"
+  systemctl enable docker
+  systemctl start docker
 
-install_redis() {
-  log_info "Installing Redis..."
-  
-  if command -v redis-cli &> /dev/null; then
-    log_warn "Redis is already installed. Skipping..."
-  else
-    apt install redis-server -y
-    systemctl start redis-server
-    systemctl enable redis-server
-    log_info "Redis installed successfully"
-  fi
-  
-  # Configure Redis
-  sed -i 's/^# maxmemory 256mb/maxmemory 512mb/' /etc/redis/redis.conf 2>/dev/null || echo "maxmemory 512mb" >> /etc/redis/redis.conf
-  sed -i 's/^# maxmemory-policy volatile-lru/maxmemory-policy allkeys-lru/' /etc/redis/redis.conf 2>/dev/null || echo "maxmemory-policy allkeys-lru" >> /etc/redis/redis.conf
-  
-  systemctl restart redis-server
-  
-  # Verify
-  redis-cli ping
-}
-
-install_nginx() {
-  log_info "Installing Nginx..."
-  
-  if command -v nginx &> /dev/null; then
-    log_warn "Nginx is already installed. Skipping..."
-  else
-    apt install nginx -y
-    systemctl start nginx
-    systemctl enable nginx
-    log_info "Nginx installed successfully"
-  fi
-}
-
-install_pm2() {
-  log_info "Installing PM2..."
-  
-  if su - "$DEPLOY_USER" -c 'command -v pm2' &> /dev/null; then
-    log_warn "PM2 is already installed. Skipping..."
-  else
-    apt install -y npm
-    npm install -g pm2
-    log_info "PM2 installed successfully"
-  fi
-  
-  # Verify
-  pm2 --version
-}
-
-install_certbot() {
-  log_info "Installing Certbot..."
-  
-  if command -v certbot &> /dev/null; then
-    log_warn "Certbot is already installed. Skipping..."
-  else
-    apt install certbot python3-certbot-nginx -y
-    log_info "Certbot installed successfully"
-  fi
+  docker compose version
 }
 
 clone_repository() {
   log_info "Cloning repository..."
-  
+
   if [ -d "$APP_DIR" ]; then
     log_warn "Repository already exists. Pulling latest changes..."
-    cd "$APP_DIR"
     su - "$DEPLOY_USER" -c "cd $APP_DIR && git pull origin main"
   else
     su - "$DEPLOY_USER" -c "git clone $GIT_REPO $APP_DIR"
@@ -249,317 +147,298 @@ clone_repository() {
   fi
 }
 
-install_dependencies() {
-  log_info "Installing application dependencies..."
-  su - "$DEPLOY_USER" -c "cd $APP_DIR && bun install"
+create_compose_override() {
+  log_info "Creating docker-compose.prod.yml..."
+
+  cat > "$APP_DIR/docker-compose.prod.yml" << EOF
+# Generated by deploy.sh — production overrides for Docker Compose
+services:
+  api:
+    volumes:
+      - $STORAGE_DIR:/data/repos
+    environment:
+      STORAGE_TYPE: local
+      STORAGE_LOCAL_PATH: /data/repos
+
+  migrate:
+    profiles: [tools]
+    image: oven/bun:1.3.5
+    working_dir: /app
+    volumes:
+      - .:/app
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql://sigmagit:\${POSTGRES_PASSWORD}@postgres:5432/sigmagit
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - sigmagit
+    command: ["sh", "-c", "bun install && cd packages/db && bun run db:migrate"]
+
+  discord-bot:
+    profiles: [discord]
+    build:
+      context: .
+      dockerfile: apps/discord-bot/Dockerfile
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql://sigmagit:\${POSTGRES_PASSWORD}@postgres:5432/sigmagit
+      REDIS_SESSION_URL: redis://redis-session:6379
+      REDIS_CACHE_URL: redis://redis-cache:6379
+    depends_on:
+      postgres:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+    networks:
+      - sigmagit
+EOF
+
+  chown "$DEPLOY_USER:$DEPLOY_USER" "$APP_DIR/docker-compose.prod.yml"
+  log_info "docker-compose.prod.yml created"
 }
 
 create_env_file() {
   log_info "Creating environment file..."
-  
+
   cat > "$APP_DIR/.env" << EOF
 # Application
 NODE_ENV=production
-API_URL=https://$API_DOMAIN
 WEB_URL=https://$WEB_DOMAIN
+API_URL=https://$WEB_DOMAIN
+VITE_API_URL=https://$WEB_DOMAIN
+TRUST_PROXY=true
 
-# Database
-DATABASE_URL=postgresql://$DB_USER:$DB_PASSWORD@localhost:5432/$DB_NAME
+# Docker Compose
+POSTGRES_PASSWORD=$POSTGRES_PASSWORD
 
-# Storage (Local for VPS)
+# Database (used by migrate profile and host tooling)
+DATABASE_URL=postgresql://sigmagit:$POSTGRES_PASSWORD@postgres:5432/sigmagit
+
+# Storage (local volume mounted into api container)
 STORAGE_TYPE=local
-STORAGE_PATH=$STORAGE_DIR
+STORAGE_LOCAL_PATH=/data/repos
 
-# Redis
-REDIS_URL=redis://localhost:6379
-
-# Authentication
+# Auth
 BETTER_AUTH_SECRET=$BETTER_AUTH_SECRET
-BETTER_AUTH_URL=https://$API_DOMAIN
+BETTER_AUTH_URL=https://$WEB_DOMAIN
 
 # Email
+EMAIL_PROVIDER=resend
 RESEND_API_KEY=$RESEND_API_KEY
 SMTP_HOST=$SMTP_HOST
 SMTP_PORT=$SMTP_PORT
 SMTP_USER=$SMTP_USER
-SMTP_PASSWORD=$SMTP_PASSWORD
+SMTP_PASS=$SMTP_PASSWORD
+EMAIL_FROM=Sigmagit <noreply@$WEB_DOMAIN>
 
-# Discord Bot (Optional)
+# Discord (optional — enable with: docker compose --profile discord up -d)
 DISCORD_BOT_TOKEN=$DISCORD_BOT_TOKEN
-DISCORD_BOT_CLIENT_ID=$DISCORD_BOT_CLIENT_ID
-DISCORD_WEBHOOK_SECRET=$DISCORD_WEBHOOK_SECRET
+DISCORD_CLIENT_ID=$DISCORD_CLIENT_ID
 EOF
-  
+
   chmod 600 "$APP_DIR/.env"
   chown "$DEPLOY_USER:$DEPLOY_USER" "$APP_DIR/.env"
-  
   log_info "Environment file created successfully"
+}
+
+configure_caddyfile() {
+  log_info "Configuring Caddyfile for $WEB_DOMAIN..."
+
+  if [ -f "$APP_DIR/Caddyfile" ] && [ ! -f "$APP_DIR/Caddyfile.bak" ]; then
+    cp "$APP_DIR/Caddyfile" "$APP_DIR/Caddyfile.bak"
+  fi
+
+  cat > "$APP_DIR/Caddyfile" << EOF
+{
+    email admin@$WEB_DOMAIN
+
+    servers {
+        client_ip_headers X-Forwarded-For X-Real-IP
+    }
+}
+
+$WEB_DOMAIN {
+    handle /health {
+        reverse_proxy {\$API_UPSTREAM:localhost:3001}
+    }
+
+    handle /api/health {
+        reverse_proxy {\$API_UPSTREAM:localhost:3001}
+    }
+
+    handle /ws {
+        reverse_proxy {\$API_UPSTREAM:localhost:3001}
+    }
+
+    handle /v2/* {
+        request_body {
+            max_size 500MB
+        }
+        reverse_proxy {\$API_UPSTREAM:localhost:3001} {
+            flush_interval -1
+            transport http {
+                read_timeout 600s
+                write_timeout 600s
+            }
+        }
+    }
+
+    handle /file/* {
+        reverse_proxy {\$API_UPSTREAM:localhost:3001}
+    }
+
+    @git path_regexp git ^/[^/]+/[^/]+\\.git(/.*)?\$
+    handle @git {
+        request_body {
+            max_size 100MB
+        }
+        reverse_proxy {\$API_UPSTREAM:localhost:3001} {
+            flush_interval -1
+            transport http {
+                read_timeout 600s
+                write_timeout 600s
+            }
+        }
+    }
+
+    handle /api/* {
+        reverse_proxy {\$API_UPSTREAM:localhost:3001}
+    }
+
+    handle {
+        reverse_proxy {\$WEB_UPSTREAM:localhost:3000}
+    }
+
+    @compressible not path /v2/* /file/* /ws
+    @compressible not path_regexp git ^/[^/]+/[^/]+\\.git(/.*)?\$
+    encode @compressible zstd gzip
+
+    log {
+        output stdout
+    }
+}
+EOF
+
+  if [ -n "$DOCS_DOMAIN" ]; then
+    cat >> "$APP_DIR/Caddyfile" << EOF
+
+$DOCS_DOMAIN {
+    reverse_proxy {\$DOCS_UPSTREAM:localhost:3003}
+
+    encode zstd gzip
+
+    log {
+        output stdout
+    }
+}
+EOF
+  fi
+
+  chown "$DEPLOY_USER:$DEPLOY_USER" "$APP_DIR/Caddyfile"
+  log_info "Caddyfile configured"
+}
+
+build_and_start() {
+  log_info "Building and starting services with Docker Compose..."
+
+  compose_cmd "build"
+
+  if [ "$ENABLE_DISCORD" = "true" ]; then
+    compose_cmd "--profile discord up -d"
+  else
+    compose_cmd "up -d"
+  fi
+
+  log_info "Services started"
 }
 
 run_migrations() {
   log_info "Running database migrations..."
-  su - "$DEPLOY_USER" -c "cd $APP_DIR && bun run db:migrate"
+  compose_cmd "--profile tools run --rm migrate"
+  log_info "Migrations completed"
 }
 
-build_application() {
-  log_info "Building application..."
-  su - "$DEPLOY_USER" -c "cd $APP_DIR && bun run build"
-}
-
-configure_nginx() {
-  log_info "Configuring Nginx..."
-  
-  # Web app configuration
-  cat > "/etc/nginx/sites-available/sigmagit-web" << EOF
-server {
-    listen 80;
-    server_name $WEB_DOMAIN www.$WEB_DOMAIN;
-
-    root $APP_DIR/apps/web/build/client;
-    index index.html;
-
-    # Handle client-side routing
-    location / {
-        try_files \$uri \$uri/ /index.html;
-    }
-
-    # Proxy API requests
-    location /api {
-        proxy_pass http://localhost:3001;
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection 'upgrade';
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
-        proxy_cache_bypass \$http_upgrade;
-    }
-
-    # Gzip compression
-    gzip on;
-    gzip_vary on;
-    gzip_min_length 1024;
-    gzip_types text/plain text/css text/xml text/javascript application/x-javascript application/xml+rss application/json;
-}
-EOF
-  
-  # API configuration
-  cat > "/etc/nginx/sites-available/sigmagit-api" << EOF
-server {
-    listen 80;
-    server_name $API_DOMAIN;
-
-    # Handle Git smart HTTP protocol
-    location ~ /\.git {
-        client_max_body_size 100M;
-        proxy_pass http://localhost:3001;
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection 'upgrade';
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
-        proxy_read_timeout 300s;
-        proxy_connect_timeout 300s;
-        proxy_send_timeout 300s;
-    }
-
-    # API endpoints
-    location / {
-        proxy_pass http://localhost:3001;
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection 'upgrade';
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
-    }
-}
-EOF
-  
-  # Enable sites
-  ln -sf /etc/nginx/sites-available/sigmagit-web /etc/nginx/sites-enabled/
-  ln -sf /etc/nginx/sites-available/sigmagit-api /etc/nginx/sites-enabled/
-  rm -f /etc/nginx/sites-enabled/default
-  
-  # Test and reload Nginx
-  nginx -t && systemctl reload nginx
-  
-  log_info "Nginx configured successfully"
-}
-
-setup_ssl() {
-  log_info "Setting up SSL certificates..."
-  
-  # Obtain SSL for web domain
-  certbot --nginx -d "$WEB_DOMAIN" -d "www.$WEB_DOMAIN" --non-interactive --agree-tos --email "admin@$WEB_DOMAIN" || true
-  
-  # Obtain SSL for API domain
-  certbot --nginx -d "$API_DOMAIN" --non-interactive --agree-tos || true
-  
-  log_info "SSL certificates configured"
-}
-
-create_pm2_ecosystem() {
-  log_info "Creating PM2 ecosystem configuration..."
-  
-  cat > "$APP_DIR/ecosystem.config.js" << EOF
-module.exports = {
-  apps: [
-    {
-      name: 'sigmagit-api',
-      script: 'apps/api/dist/index.js',
-      interpreter: 'node',
-      cwd: '$APP_DIR',
-      instances: 2,
-      exec_mode: 'cluster',
-      env: {
-        NODE_ENV: 'production',
-      },
-      error_file: '$LOGS_DIR/api-error.log',
-      out_file: '$LOGS_DIR/api-out.log',
-      log_date_format: 'YYYY-MM-DD HH:mm:ss',
-      max_memory_restart: '1G',
-    },
-    {
-      name: 'sigmagit-discord',
-      script: 'apps/discord-bot/src/index.ts',
-      interpreter: 'bun',
-      interpreter_args: '--env-file .env',
-      cwd: '$APP_DIR',
-      error_file: '$LOGS_DIR/discord-error.log',
-      out_file: '$LOGS_DIR/discord-out.log',
-      log_date_format: 'YYYY-MM-DD HH:mm:ss',
-    }
-  ],
-};
-EOF
-  
-  chown "$DEPLOY_USER:$DEPLOY_USER" "$APP_DIR/ecosystem.config.js"
-  
-  log_info "PM2 ecosystem configuration created"
-}
-
-start_applications() {
-  log_info "Starting applications with PM2..."
-  
-  su - "$DEPLOY_USER" -c "cd $APP_DIR && pm2 start ecosystem.config.js"
-  su - "$DEPLOY_USER" -c "pm2 save"
-  
-  # Setup PM2 startup
-  su - "$DEPLOY_USER" -c "pm2 startup" -u "$DEPLOY_USER" | grep -E '^sudo env PATH=' | sh || true
-  
-  log_info "Applications started successfully"
+wait_for_healthy() {
+  log_info "Waiting for PostgreSQL to become ready..."
+  local retries=30
+  while [ $retries -gt 0 ]; do
+    if compose_cmd "exec -T postgres pg_isready -U sigmagit -d sigmagit" >/dev/null 2>&1; then
+      log_info "PostgreSQL is ready"
+      return 0
+    fi
+    retries=$((retries - 1))
+    sleep 2
+  done
+  log_warn "Timed out waiting for PostgreSQL — check: cd $APP_DIR && docker compose $COMPOSE_FILES ps"
 }
 
 configure_firewall() {
   log_info "Configuring firewall..."
-  
-  # Check if UFW is installed
-  if ! command -v ufw &> /dev/null; then
-    apt install ufw -y
+
+  if ! command -v ufw &>/dev/null; then
+    apt-get install -y ufw
   fi
-  
-  # Allow SSH
+
   ufw allow 22/tcp
-  
-  # Allow HTTP
   ufw allow 80/tcp
-  
-  # Allow HTTPS
   ufw allow 443/tcp
-  
-  # Enable firewall
   echo "y" | ufw enable
-  
+
   log_info "Firewall configured"
 }
 
 create_backup_script() {
   log_info "Creating backup script..."
-  
+
   cat > "$SCRIPTS_DIR/backup.sh" << EOF
 #!/bin/bash
+set -e
 BACKUP_DIR="$BACKUP_DIR"
 DATE=\$(date +%Y%m%d_%H%M%S)
 BACKUP_FILE="\$BACKUP_DIR/sigmagit_\$DATE.sql"
 
-mkdir -p \$BACKUP_DIR
+mkdir -p "\$BACKUP_DIR"
 
-# Backup database
-PGPASSWORD='$DB_PASSWORD' pg_dump -h localhost -U $DB_USER $DB_NAME > \$BACKUP_FILE
+cd "$APP_DIR"
+docker compose $COMPOSE_FILES exec -T postgres \\
+  pg_dump -U sigmagit sigmagit > "\$BACKUP_FILE"
 
-# Compress
-gzip \$BACKUP_FILE
-
-# Delete backups older than 7 days
-find \$BACKUP_DIR -name "*.sql.gz" -mtime +7 -delete
+gzip "\$BACKUP_FILE"
+find "\$BACKUP_DIR" -name "*.sql.gz" -mtime +7 -delete
 
 echo "Backup completed: \${BACKUP_FILE}.gz"
 EOF
-  
+
   chmod +x "$SCRIPTS_DIR/backup.sh"
   chown "$DEPLOY_USER:$DEPLOY_USER" "$SCRIPTS_DIR/backup.sh"
-  
-  # Add to crontab
+
   (crontab -l -u "$DEPLOY_USER" 2>/dev/null || true; echo "0 2 * * * $SCRIPTS_DIR/backup.sh >> $LOGS_DIR/backup.log 2>&1") | crontab -u "$DEPLOY_USER" -
-  
+
   log_info "Backup script created and scheduled"
 }
 
-setup_log_rotation() {
-  log_info "Setting up log rotation..."
-  
-  cat > "/etc/logrotate.d/sigmagit" << EOF
-$LOGS_DIR/*.log {
-    daily
-    missingok
-    rotate 14
-    compress
-    delaycompress
-    notifempty
-    create 0640 $DEPLOY_USER $DEPLOY_USER
-    sharedscripts
-    postrotate
-        su - $DEPLOY_USER -c 'pm2 reload sigmagit-api'
-    endscript
-}
-EOF
-  
-  log_info "Log rotation configured"
-}
+create_update_script() {
+  log_info "Creating update script..."
 
-optimize_system() {
-  log_info "Optimizing system configuration..."
-  
-  # Optimize PostgreSQL
-  PG_VERSION=$(ls /etc/postgresql/ 2>/dev/null | head -1)
-  if [ -n "$PG_VERSION" ]; then
-    cat >> "/etc/postgresql/$PG_VERSION/main/postgresql.conf" << EOF
-
-# Sigmagit optimizations
-shared_buffers = 256MB
-effective_cache_size = 1GB
-maintenance_work_mem = 64MB
-checkpoint_completion_target = 0.9
-wal_buffers = 16MB
-default_statistics_target = 100
-random_page_cost = 1.1
-effective_io_concurrency = 200
-work_mem = 16MB
-min_wal_size = 1GB
-max_wal_size = 4GB
-max_worker_processes = 2
-max_parallel_workers_per_gather = 2
-max_parallel_workers = 2
+  cat > "$SCRIPTS_DIR/update.sh" << EOF
+#!/bin/bash
+set -e
+cd "$APP_DIR"
+git pull origin main
+docker compose $COMPOSE_FILES build
+docker compose $COMPOSE_FILES up -d
+docker compose $COMPOSE_FILES --profile tools run --rm migrate
+echo "Update complete"
 EOF
-    systemctl restart postgresql
-  fi
-  
-  log_info "System optimizations applied"
+
+  chmod +x "$SCRIPTS_DIR/update.sh"
+  chown "$DEPLOY_USER:$DEPLOY_USER" "$SCRIPTS_DIR/update.sh"
+  log_info "Update script created at $SCRIPTS_DIR/update.sh"
 }
 
 print_summary() {
@@ -567,78 +446,72 @@ print_summary() {
   echo
   echo "=== Summary ==="
   echo "Web URL: https://$WEB_DOMAIN"
-  echo "API URL: https://$API_DOMAIN"
+  echo "API URL: https://$WEB_DOMAIN/api"
+  if [ -n "$DOCS_DOMAIN" ]; then
+    echo "Docs URL: https://$DOCS_DOMAIN"
+  fi
   echo "User: $DEPLOY_USER"
   echo "App Directory: $APP_DIR"
   echo "Storage Directory: $STORAGE_DIR"
-  echo "Logs Directory: $LOGS_DIR"
   echo
-  echo "=== Useful Commands ==="
-  echo "View logs: pm2 logs"
-  echo "Monitor: pm2 monit"
-  echo "Restart apps: pm2 restart all"
-  echo "Update apps: cd $APP_DIR && git pull && bun install && bun run build && pm2 restart all"
-  echo "Nginx logs: sudo tail -f /var/log/nginx/access.log"
-  echo "PostgreSQL logs: sudo tail -f /var/log/postgresql/postgresql-*-main.log"
+  echo "=== Docker Compose Commands ==="
+  echo "Status:  cd $APP_DIR && docker compose $COMPOSE_FILES ps"
+  echo "Logs:    cd $APP_DIR && docker compose $COMPOSE_FILES logs -f"
+  echo "Restart: cd $APP_DIR && docker compose $COMPOSE_FILES restart"
+  echo "Update:  $SCRIPTS_DIR/update.sh"
+  echo "Backup:  $SCRIPTS_DIR/backup.sh"
+  if [ "$ENABLE_DISCORD" = "true" ]; then
+    echo "Discord bot is enabled (discord profile)"
+  else
+    echo "Discord bot disabled — set token and run: docker compose $COMPOSE_FILES --profile discord up -d"
+  fi
   echo
 }
 
-# Main deployment flow
 main() {
   echo "==================================="
-  echo "  Sigmagit VPS Deployment Script  "
+  echo "  Sigmagit Docker Compose Deploy  "
   echo "==================================="
   echo
-  
-  # Pre-flight checks
+
   check_root
   check_ubuntu_debian
-  
-  # Gather configuration
+
   log_info "Please provide the following configuration:"
   prompt_input "Git repository URL" "" GIT_REPO
-  prompt_input "Web domain (e.g., yourdomain.com)" "" WEB_DOMAIN
-  prompt_input "API domain (e.g., api.yourdomain.com)" "" API_DOMAIN
-  prompt_password "Database password" DB_PASSWORD
+  prompt_input "Primary domain (e.g., sigmagit.com)" "" WEB_DOMAIN
+  prompt_input "Docs domain (optional, press Enter to skip)" "" DOCS_DOMAIN
+  prompt_password "PostgreSQL password" POSTGRES_PASSWORD
   prompt_input "Better Auth Secret (min 32 chars)" "" BETTER_AUTH_SECRET
-  prompt_input "Resend API Key (optional, press Enter to skip)" "" RESEND_API_KEY
+  prompt_input "Resend API Key (optional)" "" RESEND_API_KEY
   prompt_input "SMTP Host (optional)" "smtp.gmail.com" SMTP_HOST
   prompt_input "SMTP Port (optional)" "587" SMTP_PORT
   prompt_input "SMTP User (optional)" "" SMTP_USER
   prompt_input "SMTP Password (optional)" "" SMTP_PASSWORD
   prompt_input "Discord Bot Token (optional)" "" DISCORD_BOT_TOKEN
-  prompt_input "Discord Bot Client ID (optional)" "" DISCORD_BOT_CLIENT_ID
-  prompt_input "Discord Webhook Secret (optional)" "" DISCORD_WEBHOOK_SECRET
-  
+  prompt_input "Discord Client ID (optional)" "" DISCORD_CLIENT_ID
+
+  if [ -n "$DISCORD_BOT_TOKEN" ] && [ -n "$DISCORD_CLIENT_ID" ]; then
+    ENABLE_DISCORD="true"
+  fi
+
   echo
   log_warn "Starting deployment process..."
   echo
-  
-  # Execute deployment steps
+
   update_system
   create_user
-  install_bun
-  install_postgresql
-  install_redis
-  install_nginx
-  install_pm2
-  install_certbot
-  
-  setup_database
+  install_docker
   clone_repository
-  install_dependencies
+  create_compose_override
   create_env_file
-  build_application
+  configure_caddyfile
+  build_and_start
+  wait_for_healthy
   run_migrations
-  configure_nginx
-  setup_ssl
-  create_pm2_ecosystem
-  start_applications
   configure_firewall
   create_backup_script
-  setup_log_rotation
-  optimize_system
-  
+  create_update_script
   print_summary
 }
 

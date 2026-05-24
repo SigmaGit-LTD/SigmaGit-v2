@@ -12,6 +12,8 @@ import { Hono } from "hono";
 import { createHash } from "crypto";
 import { randomUUID } from "crypto";
 import { getApiUrl } from "../config";
+import { readRequestBodyLimited, RequestBodyTooLargeError } from "../lib/request-body";
+import { REGISTRY_MAX_BLOB_BYTES, REGISTRY_MAX_CHUNK_BYTES } from "../middleware/limits";
 import {
   parseImageName,
   blobExists,
@@ -173,8 +175,15 @@ app.put("/v2/*/manifests/:ref", async (c) => {
   const { owner, imageName } = parsed;
   const authResult = await requireRegistryAuth(c, `${owner}/${imageName}`, "push");
   if (authResult instanceof Response) return authResult;
-  const body = await c.req.arrayBuffer();
-  const manifest = Buffer.from(body);
+  let manifest: Buffer;
+  try {
+    manifest = await readRequestBodyLimited(c.req.raw, REGISTRY_MAX_BLOB_BYTES);
+  } catch (error) {
+    if (error instanceof RequestBodyTooLargeError) {
+      return c.json({ errors: [{ code: "BLOB_UPLOAD_INVALID", message: "manifest too large" }] }, 413);
+    }
+    throw error;
+  }
   const digest = `sha256:${createHash("sha256").update(manifest).digest("hex")}`;
   if (ref.startsWith("sha256:") && ref !== digest) {
     return c.json({ errors: [{ code: "DIGEST_INVALID", message: "manifest digest mismatch" }] }, 400);
@@ -240,12 +249,23 @@ app.put("/v2/*/blobs/uploads/:uuid", async (c) => {
   const { owner, imageName } = parsed;
   const authResult = await requireRegistryAuth(c, `${owner}/${imageName}`, "push");
   if (authResult instanceof Response) return authResult;
-  const body = await c.req.arrayBuffer();
-  const trailing = body.byteLength > 0 ? Buffer.from(body) : undefined;
+  let trailing: Buffer | undefined;
+  try {
+    const body = await readRequestBodyLimited(c.req.raw, REGISTRY_MAX_CHUNK_BYTES);
+    trailing = body.byteLength > 0 ? body : undefined;
+  } catch (error) {
+    if (error instanceof RequestBodyTooLargeError) {
+      return c.json({ errors: [{ code: "BLOB_UPLOAD_INVALID", message: "chunk too large" }] }, 413);
+    }
+    throw error;
+  }
   const finalize = await finalizeUpload(owner, imageName, uuid, digest, trailing);
   if (!finalize.ok) {
     if (finalize.reason === "digest_mismatch") {
       return c.json({ errors: [{ code: "DIGEST_INVALID", message: "digest mismatch" }] }, 400);
+    }
+    if (finalize.reason === "too_large") {
+      return c.json({ errors: [{ code: "BLOB_UPLOAD_INVALID", message: "blob too large" }] }, 413);
     }
     return c.json({ errors: [{ code: "BLOB_UNKNOWN", message: "no content" }] }, 400);
   }
@@ -264,9 +284,25 @@ app.patch("/v2/*/blobs/uploads/:uuid", async (c) => {
   const { owner, imageName } = parsed;
   const authResult = await requireRegistryAuth(c, `${owner}/${imageName}`, "push");
   if (authResult instanceof Response) return authResult;
-  const body = await c.req.arrayBuffer();
-  const chunk = Buffer.from(body);
-  const result = chunk.length > 0 ? await appendUploadChunk(uuid, chunk) : { size: await getUploadSize(uuid) };
+  let chunk: Buffer;
+  try {
+    chunk = await readRequestBodyLimited(c.req.raw, REGISTRY_MAX_CHUNK_BYTES);
+  } catch (error) {
+    if (error instanceof RequestBodyTooLargeError) {
+      return c.json({ errors: [{ code: "BLOB_UPLOAD_INVALID", message: "chunk too large" }] }, 413);
+    }
+    throw error;
+  }
+
+  let result: { size: number };
+  try {
+    result = chunk.length > 0 ? await appendUploadChunk(uuid, chunk) : { size: await getUploadSize(uuid) };
+  } catch (error) {
+    if (error instanceof Error && error.message.includes("maximum blob size")) {
+      return c.json({ errors: [{ code: "BLOB_UPLOAD_INVALID", message: "blob too large" }] }, 413);
+    }
+    throw error;
+  }
   const location = `${getApiUrl()}/v2/${name}/blobs/uploads/${uuid}`;
   const end = result.size > 0 ? result.size - 1 : 0;
   return c.body("", 202, {

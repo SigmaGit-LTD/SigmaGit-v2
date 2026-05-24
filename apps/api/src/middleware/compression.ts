@@ -1,5 +1,6 @@
 import { createMiddleware } from 'hono/factory';
-import { gzip } from 'node:zlib/promises';
+import { createGzip } from 'node:zlib';
+import { Readable } from 'node:stream';
 import { MAX_COMPRESS_BYTES } from './limits';
 
 const COMPRESSIBLE = /^application\/(json|javascript|xml)|^text\//i;
@@ -13,6 +14,13 @@ function shouldSkipCompression(path: string): boolean {
     return true;
   }
   return GIT_PATH_PATTERN.test(path);
+}
+
+function gzipWebStream(body: ReadableStream<Uint8Array>): ReadableStream<Uint8Array> {
+  const nodeReadable = Readable.fromWeb(body);
+  const gzip = createGzip();
+  const compressed = nodeReadable.pipe(gzip);
+  return Readable.toWeb(compressed) as ReadableStream<Uint8Array>;
 }
 
 export const compressionMiddleware = createMiddleware(async (c, next) => {
@@ -42,18 +50,20 @@ export const compressionMiddleware = createMiddleware(async (c, next) => {
     }
   }
 
-  const body = await c.res.arrayBuffer();
-  if (body.byteLength < MIN_SIZE || body.byteLength > MAX_COMPRESS_BYTES) {
+  const originalBody = c.res.body;
+  if (!originalBody) {
     return;
   }
 
-  const compressed = await gzip(Buffer.from(body));
-  c.res = new Response(compressed, {
+  const compressedStream = gzipWebStream(originalBody);
+  const headers = new Headers(c.res.headers);
+  headers.set('Content-Encoding', 'gzip');
+  headers.delete('content-length');
+  headers.delete('transfer-encoding');
+
+  c.res = new Response(compressedStream, {
     status: c.res.status,
     statusText: c.res.statusText,
-    headers: c.res.headers,
+    headers,
   });
-  c.res.headers.set('Content-Encoding', 'gzip');
-  c.res.headers.set('Content-Length', String(compressed.length));
-  c.res.headers.delete('transfer-encoding');
 });

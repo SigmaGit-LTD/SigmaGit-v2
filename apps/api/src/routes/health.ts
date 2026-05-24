@@ -9,11 +9,11 @@ import { appCache, CACHE_TTL, getCached, setCache } from "../redis";
 
 const app = new Hono<{ Variables: AuthVariables }>();
 
-app.get("/health", (c) => {
+app.get("/health", async (c) => {
   return c.json({ status: "ok", version: "1.0.0" });
 });
 
-app.get("/api/health", (c) => {
+app.get("/api/health", async (c) => {
   return c.json({ status: "ok", version: "1.0.0" });
 });
 

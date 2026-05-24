@@ -80,22 +80,19 @@ async function getPRReviews(prId: string) {
     .where(eq(prReviews.pullRequestId, prId))
     .orderBy(desc(prReviews.createdAt));
 
-  return Promise.all(
-    reviews.map(async (review) => {
-      const author = await db.query.users.findFirst({
-        where: eq(users.id, review.authorId),
-        columns: { id: true, username: true, name: true, avatarUrl: true },
-      });
-      return {
-        id: review.id,
-        body: review.body,
-        state: review.state,
-        commitOid: review.commitOid,
-        createdAt: review.createdAt,
-        author: author || { id: review.authorId, username: "unknown", name: "Unknown", avatarUrl: null },
-      };
-    })
-  );
+  const authorsById = await getUsersByIds(reviews.map((review) => review.authorId));
+
+  return reviews.map((review) => {
+    const author = authorsById.get(review.authorId);
+    return {
+      id: review.id,
+      body: review.body,
+      state: review.state,
+      commitOid: review.commitOid,
+      createdAt: review.createdAt,
+      author: author || { id: review.authorId, username: "unknown", name: "Unknown", avatarUrl: null },
+    };
+  });
 }
 
 async function getReactionsGrouped(prId: string, userId?: string) {

@@ -1032,21 +1032,20 @@ app.get("/api/admin/audit-logs", async (c) => {
   const hasMore = logsResult.length > limit;
   const logsData = logsResult.slice(0, limit);
 
-  const logsWithActors = await Promise.all(
-    logsData.map(async (log) => {
-      const actor = log.actorId
-        ? await db.query.users.findFirst({
-            where: eq(users.id, log.actorId),
-            columns: { id: true, username: true, name: true },
-          })
-        : null;
+  const actorIds = [...new Set(logsData.map((log) => log.actorId).filter((id): id is string => id != null))];
+  const actors =
+    actorIds.length > 0
+      ? await db
+          .select({ id: users.id, username: users.username, name: users.name })
+          .from(users)
+          .where(inArray(users.id, actorIds))
+      : [];
+  const actorsById = new Map(actors.map((actor) => [actor.id, actor]));
 
-      return {
-        ...log,
-        actor,
-      };
-    })
-  );
+  const logsWithActors = logsData.map((log) => ({
+    ...log,
+    actor: log.actorId ? actorsById.get(log.actorId) ?? null : null,
+  }));
 
   return c.json({
     logs: logsWithActors,

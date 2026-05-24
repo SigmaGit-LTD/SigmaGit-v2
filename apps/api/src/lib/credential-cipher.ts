@@ -1,4 +1,7 @@
-import { createCipheriv, createDecipheriv, randomBytes, scryptSync } from "crypto";
+import { createCipheriv, createDecipheriv, randomBytes, scrypt } from "node:crypto";
+import { promisify } from "node:util";
+
+const scryptAsync = promisify(scrypt);
 
 const ALGORITHM = "aes-256-gcm";
 const KEY_LEN = 32;
@@ -7,29 +10,33 @@ const AUTH_TAG_LEN = 16;
 const SALT = "sigmagit-migration-credentials-v1";
 const VERSION_PREFIX = "v1.";
 
-let cachedKey: Buffer | null = null;
+let keyPromise: Promise<Buffer | null> | null = null;
 
-function getKey(): Buffer | null {
-  if (cachedKey !== null) return cachedKey;
-  const secret = process.env.MIGRATION_CREDENTIALS_KEY;
-  if (!secret || secret.length < 16) {
-    if (process.env.NODE_ENV === "production" || process.env.RAILWAY_ENVIRONMENT_NAME) {
-      console.warn(
-        "[CredentialCipher] MIGRATION_CREDENTIALS_KEY not set or too short; credentials will use legacy base64 (not secure)"
-      );
+async function getKey(): Promise<Buffer | null> {
+  if (keyPromise) return keyPromise;
+
+  keyPromise = (async () => {
+    const secret = process.env.MIGRATION_CREDENTIALS_KEY;
+    if (!secret || secret.length < 16) {
+      if (process.env.NODE_ENV === "production" || process.env.RAILWAY_ENVIRONMENT_NAME) {
+        console.warn(
+          "[CredentialCipher] MIGRATION_CREDENTIALS_KEY not set or too short; credentials will use legacy base64 (not secure)"
+        );
+      }
+      return null;
     }
-    return null;
-  }
-  cachedKey = scryptSync(secret, SALT, KEY_LEN);
-  return cachedKey;
+    return (await scryptAsync(secret, SALT, KEY_LEN)) as Buffer;
+  })();
+
+  return keyPromise;
 }
 
 /**
  * Encrypt a credential value for storage. Uses AES-256-GCM when
  * MIGRATION_CREDENTIALS_KEY is set; otherwise falls back to base64 (legacy).
  */
-export function encryptCredential(value: string): string {
-  const key = getKey();
+export async function encryptCredential(value: string): Promise<string> {
+  const key = await getKey();
   if (!key) {
     return Buffer.from(value, "utf-8").toString("base64");
   }
@@ -45,9 +52,9 @@ export function encryptCredential(value: string): string {
  * Decrypt a stored credential. Accepts both "v1." prefixed (AES-GCM) and
  * legacy base64-only values for backward compatibility.
  */
-export function decryptCredential(encrypted: string): string {
+export async function decryptCredential(encrypted: string): Promise<string> {
   if (encrypted.startsWith(VERSION_PREFIX)) {
-    const key = getKey();
+    const key = await getKey();
     if (!key) {
       throw new Error(
         "Stored credentials are encrypted but MIGRATION_CREDENTIALS_KEY is not set"

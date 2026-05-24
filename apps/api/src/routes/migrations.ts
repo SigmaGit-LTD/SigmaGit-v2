@@ -53,11 +53,11 @@ app.post("/api/migrations", requireAuth, async (c) => {
   if (credentials && (credentials.authToken || credentials.sshKey)) {
     await db.insert(migrationCredentials).values({
       migrationId: migration.id,
-      authToken: credentials.authToken ? encryptCredential(credentials.authToken) : null,
+      authToken: credentials.authToken ? await encryptCredential(credentials.authToken) : null,
       authType: credentials.authType || "token",
-      sshKey: credentials.sshKey ? encryptCredential(credentials.sshKey) : null,
+      sshKey: credentials.sshKey ? await encryptCredential(credentials.sshKey) : null,
       sshKeyPassphrase: credentials.sshKeyPassphrase
-        ? encryptCredential(credentials.sshKeyPassphrase)
+        ? await encryptCredential(credentials.sshKeyPassphrase)
         : null,
       createdAt: new Date(),
       updatedAt: new Date(),
@@ -139,10 +139,10 @@ app.get("/api/migrations/:id/credentials", requireAuth, async (c) => {
   return c.json({
     data: {
       authType: creds.authType,
-      authToken: creds.authToken ? decryptCredential(creds.authToken) : null,
-      sshKey: creds.sshKey ? decryptCredential(creds.sshKey) : null,
+      authToken: creds.authToken ? await decryptCredential(creds.authToken) : null,
+      sshKey: creds.sshKey ? await decryptCredential(creds.sshKey) : null,
       sshKeyPassphrase: creds.sshKeyPassphrase
-        ? decryptCredential(creds.sshKeyPassphrase)
+        ? await decryptCredential(creds.sshKeyPassphrase)
         : null,
     },
   });

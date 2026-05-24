@@ -1,5 +1,5 @@
 import { createMiddleware } from 'hono/factory';
-import { gzipSync } from 'zlib';
+import { gzip } from 'node:zlib/promises';
 
 const COMPRESSIBLE = /^application\/(json|javascript|xml)|^text\//i;
 const MIN_SIZE = 1024;
@@ -36,7 +36,7 @@ export const compressionMiddleware = createMiddleware(async (c, next) => {
     return;
   }
 
-  const compressed = gzipSync(Buffer.from(body));
+  const compressed = await gzip(Buffer.from(body));
   c.res = new Response(compressed, {
     status: c.res.status,
     statusText: c.res.statusText,

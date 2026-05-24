@@ -319,6 +319,8 @@ app.get("/api/users/:username/profile-counts", async (c) => {
 
 app.get("/api/users/:username/starred", async (c) => {
   const username = c.req.param("username");
+  const limit = parseLimit(c.req.query("limit"), 30);
+  const offset = parseOffset(c.req.query("offset"), 0);
 
   const userResult = await db.query.users.findFirst({
     where: eq(users.username, username),
@@ -348,13 +350,18 @@ app.get("/api/users/:username/starred", async (c) => {
     .innerJoin(repositories, eq(stars.repositoryId, repositories.id))
     .innerJoin(users, eq(repositories.ownerId, users.id))
     .where(and(eq(stars.userId, userResult.id), eq(repositories.visibility, "public")))
-    .orderBy(desc(stars.createdAt));
+    .orderBy(desc(stars.createdAt))
+    .limit(limit + 1)
+    .offset(offset);
 
-  if (starredRepos.length === 0) {
-    return c.json({ repos: [] });
+  const hasMore = starredRepos.length > limit;
+  const pageStarred = starredRepos.slice(0, limit);
+
+  if (pageStarred.length === 0) {
+    return c.json({ repos: [], hasMore: false });
   }
 
-  const repoIds = starredRepos.map((r) => r.id);
+  const repoIds = pageStarred.map((r) => r.id);
   const countRows = await db
     .select({
       repositoryId: stars.repositoryId,
@@ -369,7 +376,7 @@ app.get("/api/users/:username/starred", async (c) => {
     countByRepoId.set(row.repositoryId, Number(row.count) || 0);
   }
 
-  const repos = starredRepos.map((r) => ({
+  const repos = pageStarred.map((r) => ({
     id: r.id,
     name: r.name,
     description: r.description,
@@ -387,7 +394,7 @@ app.get("/api/users/:username/starred", async (c) => {
     },
   }));
 
-  return c.json({ repos });
+  return c.json({ repos, hasMore });
 });
 
 export default app;

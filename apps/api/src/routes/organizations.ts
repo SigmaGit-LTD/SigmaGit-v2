@@ -2,7 +2,8 @@ import { Hono } from "hono";
 import { db, organizations, organizationMembers, teams, teamMembers, teamRepositories, organizationInvitations, users, repositories } from "@sigmagit/db";
 import { eq, and, sql, desc } from "drizzle-orm";
 import { requireAuth, type AuthVariables } from "../middleware/auth";
-import { canAccessRepository } from "../lib/access";
+import { filterAccessibleRepos } from "../lib/access";
+import { parseLimit, parseOffset } from "../lib/validation";
 import { logAuditEvent } from "./admin";
 import { randomUUID } from "crypto";
 
@@ -796,6 +797,8 @@ app.delete("/api/organizations/:org/teams/:team/repos/:repo", requireAuth, async
 app.get("/api/organizations/:org/repositories", async (c) => {
   const orgName = c.req.param("org");
   const currentUser = c.get("user");
+  const limit = parseLimit(c.req.query("limit"), 30);
+  const offset = parseOffset(c.req.query("offset"), 0);
 
   const [org] = await db
     .select()
@@ -810,18 +813,13 @@ app.get("/api/organizations/:org/repositories", async (c) => {
     .select()
     .from(repositories)
     .where(eq(repositories.organizationId, org.id))
-    .orderBy(desc(repositories.createdAt));
+    .orderBy(desc(repositories.createdAt))
+    .limit(limit + 1)
+    .offset(offset);
 
-  const accessibleRepos = (
-    await Promise.all(
-      repos.map(async (repo) => ({
-        repo,
-        allowed: await canAccessRepository(repo, currentUser),
-      }))
-    )
-  )
-    .filter(({ allowed }) => allowed)
-    .map(({ repo }) => repo);
+  const hasMore = repos.length > limit;
+  const pageRepos = repos.slice(0, limit);
+  const accessibleRepos = await filterAccessibleRepos(pageRepos, currentUser);
 
   const reposWithOwner = accessibleRepos.map((repo) => ({
     ...repo,
@@ -833,7 +831,7 @@ app.get("/api/organizations/:org/repositories", async (c) => {
     },
   }));
 
-  return c.json({ repositories: reposWithOwner });
+  return c.json({ repositories: reposWithOwner, hasMore });
 });
 
 app.post("/api/organizations/:org/invitations", requireAuth, async (c) => {

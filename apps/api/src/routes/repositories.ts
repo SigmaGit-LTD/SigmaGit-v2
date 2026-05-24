@@ -597,6 +597,8 @@ app.get("/api/repositories/public", async (c) => {
 app.get("/api/repositories/user/:username", async (c) => {
   const username = c.req.param("username");
   const currentUser = c.get("user");
+  const limit = parseLimit(c.req.query("limit"), 30);
+  const offset = parseOffset(c.req.query("offset"), 0);
 
   const userResult = await db.query.users.findFirst({
     where: eq(users.username, username),
@@ -614,13 +616,18 @@ app.get("/api/repositories/user/:username", async (c) => {
       ? eq(repositories.ownerId, userResult.id)
       : and(eq(repositories.ownerId, userResult.id), eq(repositories.visibility, "public")),
     orderBy: desc(repositories.updatedAt),
+    limit: limit + 1,
+    offset,
   });
 
-  if (reposResult.length === 0) {
-    return c.json({ repos: [] });
+  const hasMore = reposResult.length > limit;
+  const pageRepos = reposResult.slice(0, limit);
+
+  if (pageRepos.length === 0) {
+    return c.json({ repos: [], hasMore: false });
   }
 
-  const repoIds = reposResult.map((r) => r.id);
+  const repoIds = pageRepos.map((r) => r.id);
   const countRows = await db
     .select({
       repositoryId: stars.repositoryId,
@@ -644,7 +651,7 @@ app.get("/api/repositories/user/:username", async (c) => {
     starredRepoIds = new Set(starredRows.map((r) => r.repositoryId));
   }
 
-  const reposWithStars = reposResult.map((repo) => ({
+  const reposWithStars = pageRepos.map((repo) => ({
     ...repo,
     owner: {
       id: userResult.id,
@@ -656,7 +663,7 @@ app.get("/api/repositories/user/:username", async (c) => {
     ...(currentUser && { starredByViewer: starredRepoIds.has(repo.id) }),
   }));
 
-  return c.json({ repos: reposWithStars });
+  return c.json({ repos: reposWithStars, hasMore });
 });
 
 app.post("/api/repositories/:id/star", requireAuth, async (c) => {
@@ -878,32 +885,41 @@ app.get("/api/repositories/:owner/:name/forks", async (c) => {
     .limit(limit)
     .offset(offset);
 
-  const forks = await Promise.all(
-    forkRows.map(async (row) => {
-      const [starCount] = await db
-        .select({ count: sql<number>`COUNT(*)` })
-        .from(stars)
-        .where(eq(stars.repositoryId, row.id));
+  const forkIds = forkRows.map((row) => row.id);
+  const countRows =
+    forkIds.length > 0
+      ? await db
+          .select({
+            repositoryId: stars.repositoryId,
+            count: sql<number>`COUNT(*)::int`.as("cnt"),
+          })
+          .from(stars)
+          .where(inArray(stars.repositoryId, forkIds))
+          .groupBy(stars.repositoryId)
+      : [];
 
-      return {
-        id: row.id,
-        name: row.name,
-        description: row.description,
-        visibility: row.visibility,
-        defaultBranch: row.defaultBranch,
-        createdAt: row.createdAt,
-        updatedAt: row.updatedAt,
-        ownerId: row.ownerId,
-        owner: {
-          id: row.ownerId,
-          username: row.username,
-          name: row.userName,
-          avatarUrl: row.avatarUrl,
-        },
-        starCount: Number(starCount?.count) || 0,
-      };
-    })
-  );
+  const countByRepoId = new Map<string, number>();
+  for (const row of countRows) {
+    countByRepoId.set(row.repositoryId, Number(row.count) || 0);
+  }
+
+  const forks = forkRows.map((row) => ({
+    id: row.id,
+    name: row.name,
+    description: row.description,
+    visibility: row.visibility,
+    defaultBranch: row.defaultBranch,
+    createdAt: row.createdAt,
+    updatedAt: row.updatedAt,
+    ownerId: row.ownerId,
+    owner: {
+      id: row.ownerId,
+      username: row.username,
+      name: row.userName,
+      avatarUrl: row.avatarUrl,
+    },
+    starCount: countByRepoId.get(row.id) ?? 0,
+  }));
 
   return c.json({ forks });
 });

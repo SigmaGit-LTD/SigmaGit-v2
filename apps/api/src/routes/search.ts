@@ -3,7 +3,7 @@ import { db, users, repositories, issues, pullRequests } from "@sigmagit/db";
 import { eq, and, or, ilike, desc } from "drizzle-orm";
 import { type AuthVariables } from "../middleware/auth";
 import { parseLimit, parseOffset } from "../lib/validation";
-import { canAccessRepository, type AccessUser, type Repository } from "../lib/access";
+import { filterAccessibleRepos, type Repository } from "../lib/access";
 
 const app = new Hono<{ Variables: AuthVariables }>();
 
@@ -22,14 +22,18 @@ type SearchResult = {
   createdAt: string;
 };
 
-async function filterAccessibleRepos<T extends Repository>(repos: T[], user: AccessUser): Promise<T[]> {
-  const accessChecks = await Promise.all(
-    repos.map(async (repo) => ({
-      repo,
-      allowed: await canAccessRepository(repo, user),
-    }))
-  );
-  return accessChecks.filter(({ allowed }) => allowed).map(({ repo }) => repo);
+function toRepoAccessInfo(row: {
+  repoId: string;
+  repoOwnerId: string;
+  organizationId: string | null;
+  repoVisibility: string;
+}): Repository {
+  return {
+    id: row.repoId,
+    ownerId: row.repoOwnerId,
+    organizationId: row.organizationId,
+    visibility: row.repoVisibility,
+  };
 }
 
 app.get("/api/search", async (c) => {
@@ -117,25 +121,11 @@ app.get("/api/search", async (c) => {
       .offset(0);
 
     const accessibleIssues = (
-      await Promise.all(
-        issueResults.map(async (issue) => ({
-          issue,
-          allowed: await canAccessRepository(
-            {
-              id: issue.repoId,
-              ownerId: issue.repoOwnerId,
-              organizationId: issue.organizationId,
-              visibility: issue.repoVisibility,
-            },
-            currentUser
-          ),
-        }))
-      )
-    )
-      .filter(({ allowed }) => allowed)
-      .map(({ issue }) => issue);
+      await filterAccessibleRepos(issueResults.map(toRepoAccessInfo), currentUser)
+    ).reduce((set, repo) => set.add(repo.id), new Set<string>());
+    const filteredIssues = issueResults.filter((issue) => accessibleIssues.has(issue.repoId));
 
-    const pagedIssues = accessibleIssues.slice(type === "all" ? 0 : offset, type === "all" ? 5 : offset + limit);
+    const pagedIssues = filteredIssues.slice(type === "all" ? 0 : offset, type === "all" ? 5 : offset + limit);
 
     for (const issue of pagedIssues) {
       results.push({
@@ -181,26 +171,12 @@ app.get("/api/search", async (c) => {
       .limit(type === "all" ? 20 : limit + offset)
       .offset(0);
 
-    const accessiblePrs = (
-      await Promise.all(
-        prResults.map(async (pr) => ({
-          pr,
-          allowed: await canAccessRepository(
-            {
-              id: pr.repoId,
-              ownerId: pr.repoOwnerId,
-              organizationId: pr.organizationId,
-              visibility: pr.repoVisibility,
-            },
-            currentUser
-          ),
-        }))
-      )
-    )
-      .filter(({ allowed }) => allowed)
-      .map(({ pr }) => pr);
+    const accessiblePrIds = (
+      await filterAccessibleRepos(prResults.map(toRepoAccessInfo), currentUser)
+    ).reduce((set, repo) => set.add(repo.id), new Set<string>());
+    const filteredPrs = prResults.filter((pr) => accessiblePrIds.has(pr.repoId));
 
-    const pagedPrs = accessiblePrs.slice(type === "all" ? 0 : offset, type === "all" ? 5 : offset + limit);
+    const pagedPrs = filteredPrs.slice(type === "all" ? 0 : offset, type === "all" ? 5 : offset + limit);
 
     for (const pr of pagedPrs) {
       results.push({

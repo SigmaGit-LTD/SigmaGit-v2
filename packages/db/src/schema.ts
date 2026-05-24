@@ -49,18 +49,25 @@ export const users = pgTable("users", {
   updatedAt: timestamp("updated_at").notNull().defaultNow(),
 });
 
-export const sessions = pgTable("sessions", {
-  id: text("id").primaryKey(),
-  expiresAt: timestamp("expires_at").notNull(),
-  token: text("token").notNull().unique(),
-  createdAt: timestamp("created_at").notNull().defaultNow(),
-  updatedAt: timestamp("updated_at").notNull().defaultNow(),
-  ipAddress: text("ip_address"),
-  userAgent: text("user_agent"),
-  userId: text("user_id")
-    .notNull()
-    .references(() => users.id, { onDelete: "cascade" }),
-});
+export const sessions = pgTable(
+  "sessions",
+  {
+    id: text("id").primaryKey(),
+    expiresAt: timestamp("expires_at").notNull(),
+    token: text("token").notNull().unique(),
+    createdAt: timestamp("created_at").notNull().defaultNow(),
+    updatedAt: timestamp("updated_at").notNull().defaultNow(),
+    ipAddress: text("ip_address"),
+    userAgent: text("user_agent"),
+    userId: text("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+  },
+  (table) => [
+    index("sessions_expires_at_idx").on(table.expiresAt),
+    index("sessions_user_id_idx").on(table.userId),
+  ]
+);
 
 export const accounts = pgTable("accounts", {
   id: text("id").primaryKey(),
@@ -80,14 +87,18 @@ export const accounts = pgTable("accounts", {
   updatedAt: timestamp("updated_at").notNull().defaultNow(),
 });
 
-export const verifications = pgTable("verifications", {
-  id: text("id").primaryKey(),
-  identifier: text("identifier").notNull(),
-  value: text("value").notNull(),
-  expiresAt: timestamp("expires_at").notNull(),
-  createdAt: timestamp("created_at").notNull().defaultNow(),
-  updatedAt: timestamp("updated_at").notNull().defaultNow(),
-});
+export const verifications = pgTable(
+  "verifications",
+  {
+    id: text("id").primaryKey(),
+    identifier: text("identifier").notNull(),
+    value: text("value").notNull(),
+    expiresAt: timestamp("expires_at").notNull(),
+    createdAt: timestamp("created_at").notNull().defaultNow(),
+    updatedAt: timestamp("updated_at").notNull().defaultNow(),
+  },
+  (table) => [index("verifications_expires_at_idx").on(table.expiresAt)]
+);
 
 export const organizations = pgTable(
   "organizations",
@@ -273,7 +284,10 @@ export const stars = pgTable(
       .references(() => repositories.id, { onDelete: "cascade" }),
     createdAt: timestamp("created_at").notNull().defaultNow(),
   },
-  (table) => [primaryKey({ columns: [table.userId, table.repositoryId] })]
+  (table) => [
+    primaryKey({ columns: [table.userId, table.repositoryId] }),
+    index("stars_repository_id_idx").on(table.repositoryId),
+  ]
 );
 
 export const issues = pgTable(
@@ -1642,6 +1656,7 @@ export const runners = pgTable(
   (table) => [
     index("runners_status_idx").on(table.status),
     index("runners_token_idx").on(table.token),
+    index("runners_last_seen_at_idx").on(table.lastSeenAt),
   ]
 );
 
@@ -1723,6 +1738,7 @@ export const workflowJobs = pgTable(
     index("workflow_jobs_run_id_idx").on(table.runId),
     index("workflow_jobs_status_idx").on(table.status),
     index("workflow_jobs_runner_id_idx").on(table.runnerId),
+    index("workflow_jobs_status_created_at_idx").on(table.status, table.createdAt),
   ]
 );
 

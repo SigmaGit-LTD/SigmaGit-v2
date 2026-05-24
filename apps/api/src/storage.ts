@@ -1,6 +1,5 @@
 import { readdir, readFile, writeFile, unlink, mkdir, stat, rm } from 'node:fs/promises';
 import { join, dirname } from 'node:path';
-import { existsSync } from 'node:fs';
 import { config } from './config';
 import {
   S3Client,
@@ -238,13 +237,27 @@ class S3StorageBackend implements StorageBackend {
 class LocalStorageBackend implements StorageBackend {
   type: StorageType = 'local';
   private basePath: string;
+  private initPromise: Promise<void> | null = null;
 
   constructor() {
     this.basePath = config.storage.localPath;
+  }
 
-    if (!existsSync(this.basePath)) {
-      mkdir(this.basePath, { recursive: true });
+  private ensureBasePath(): Promise<void> {
+    if (!this.initPromise) {
+      this.initPromise = (async () => {
+        try {
+          await stat(this.basePath);
+        } catch (error: any) {
+          if (error.code === 'ENOENT') {
+            await mkdir(this.basePath, { recursive: true });
+            return;
+          }
+          throw error;
+        }
+      })();
     }
+    return this.initPromise;
   }
 
   private getFullPath(key: string): string {
@@ -252,6 +265,7 @@ class LocalStorageBackend implements StorageBackend {
   }
 
   async get(key: string): Promise<Buffer | null> {
+    await this.ensureBasePath();
     try {
       const fullPath = this.getFullPath(key);
       const data = await readFile(fullPath);
@@ -265,13 +279,10 @@ class LocalStorageBackend implements StorageBackend {
   }
 
   async put(key: string, body: Buffer | Uint8Array | string): Promise<void> {
+    await this.ensureBasePath();
     const fullPath = this.getFullPath(key);
     const dir = dirname(fullPath);
-
-    if (!existsSync(dir)) {
-      await mkdir(dir, { recursive: true });
-    }
-
+    await mkdir(dir, { recursive: true });
     await writeFile(fullPath, body);
   }
 
@@ -300,10 +311,16 @@ class LocalStorageBackend implements StorageBackend {
   }
 
   async list(prefix: string): Promise<string[]> {
+    await this.ensureBasePath();
     const fullPath = this.getFullPath(prefix);
 
-    if (!existsSync(fullPath)) {
-      return [];
+    try {
+      await stat(fullPath);
+    } catch (error: any) {
+      if (error.code === 'ENOENT') {
+        return [];
+      }
+      throw error;
     }
 
     const keys: string[] = [];
@@ -318,10 +335,16 @@ class LocalStorageBackend implements StorageBackend {
   }
 
   async deletePrefix(prefix: string): Promise<void> {
+    await this.ensureBasePath();
     const fullPath = this.getFullPath(prefix);
 
-    if (!existsSync(fullPath)) {
-      return;
+    try {
+      await stat(fullPath);
+    } catch (error: any) {
+      if (error.code === 'ENOENT') {
+        return;
+      }
+      throw error;
     }
 
     await rm(fullPath, { recursive: true, force: true });

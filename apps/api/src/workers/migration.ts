@@ -2,10 +2,9 @@ import { db, repositoryMigrations, repositories, users, migrationCredentials } f
 import { eq, and } from "drizzle-orm";
 import { getRepoPrefix, putObject } from "../s3";
 import { exec } from "bun";
-import { mkdir, rm, writeFile } from "fs/promises";
+import { mkdir, rm, writeFile, stat } from "fs/promises";
 import { join } from "path";
 import { randomUUID } from "crypto";
-import { existsSync } from "fs";
 import { decryptCredential } from "../lib/credential-cipher";
 
 const TEMP_DIR = "/tmp/sigmagit-migrations";
@@ -58,8 +57,8 @@ export async function processMigration(migrationId: string) {
   let authType = "token";
   if (creds) {
     authType = creds.authType || "token";
-    if (creds.authToken) authToken = decryptCredential(creds.authToken);
-    if (creds.sshKey) sshKey = decryptCredential(creds.sshKey);
+    if (creds.authToken) authToken = await decryptCredential(creds.authToken);
+    if (creds.sshKey) sshKey = await decryptCredential(creds.sshKey);
   }
 
   try {
@@ -153,7 +152,8 @@ export async function processMigration(migrationId: string) {
     await db.update(repositoryMigrations).set({ status: "failed", errorMessage: error instanceof Error ? error.message : "Unknown error", updatedAt: new Date() }).where(eq(repositoryMigrations.id, migrationId));
     try {
       const tempRepoPath = join(TEMP_DIR, migrationId);
-      if (existsSync(tempRepoPath)) await rm(tempRepoPath, { recursive: true, force: true });
+      await stat(tempRepoPath);
+      await rm(tempRepoPath, { recursive: true, force: true });
     } catch { /* ignore */ }
   }
 }

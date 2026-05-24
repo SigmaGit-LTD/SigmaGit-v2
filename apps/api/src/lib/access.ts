@@ -5,7 +5,7 @@ import {
   teamRepositories,
   teamMembers,
 } from '@sigmagit/db';
-import { eq, and } from 'drizzle-orm';
+import { eq, and, inArray } from 'drizzle-orm';
 
 export type AccessUser = { id: string; role?: string } | null | undefined;
 export type Repository = {
@@ -136,6 +136,135 @@ export async function canAccessRepository(
   }
 
   return false;
+}
+
+/**
+ * Filter a list of repositories to those the user can access.
+ * Uses batched DB queries instead of per-repo canAccessRepository calls.
+ */
+export async function filterAccessibleRepos<T extends Repository>(
+  repos: T[],
+  user: AccessUser,
+  writeRequired = false
+): Promise<T[]> {
+  if (repos.length === 0) return [];
+
+  if (user?.role === 'admin' && user?.id && !writeRequired) {
+    return repos;
+  }
+
+  const accessibleIds = new Set<string>();
+
+  if (!writeRequired) {
+    for (const repo of repos) {
+      if (repo.visibility === 'public') {
+        accessibleIds.add(repo.id);
+      }
+    }
+  }
+
+  if (!user?.id) {
+    return repos.filter((r) => accessibleIds.has(r.id));
+  }
+
+  const userId = user.id;
+  const repoIds = repos.map((r) => r.id);
+
+  for (const repo of repos) {
+    if (repo.ownerId === userId) {
+      accessibleIds.add(repo.id);
+    }
+  }
+
+  const orgIds = [
+    ...new Set(repos.map((r) => r.organizationId).filter((id): id is string => id != null)),
+  ];
+
+  const [collaboratorRows, orgMemberRows, teamPermRows] = await Promise.all([
+    db
+      .select({
+        repositoryId: repositoryCollaborators.repositoryId,
+        permission: repositoryCollaborators.permission,
+      })
+      .from(repositoryCollaborators)
+      .where(
+        and(
+          inArray(repositoryCollaborators.repositoryId, repoIds),
+          eq(repositoryCollaborators.userId, userId)
+        )
+      ),
+    orgIds.length > 0
+      ? db
+          .select({
+            organizationId: organizationMembers.organizationId,
+            role: organizationMembers.role,
+          })
+          .from(organizationMembers)
+          .where(
+            and(
+              inArray(organizationMembers.organizationId, orgIds),
+              eq(organizationMembers.userId, userId)
+            )
+          )
+      : Promise.resolve([]),
+    db
+      .select({
+        repositoryId: teamRepositories.repositoryId,
+        permission: teamRepositories.permission,
+      })
+      .from(teamRepositories)
+      .innerJoin(teamMembers, eq(teamMembers.teamId, teamRepositories.teamId))
+      .where(
+        and(inArray(teamRepositories.repositoryId, repoIds), eq(teamMembers.userId, userId))
+      ),
+  ]);
+
+  const collabByRepo = new Map(collaboratorRows.map((r) => [r.repositoryId, r.permission]));
+  const orgRoleByOrgId = new Map(orgMemberRows.map((r) => [r.organizationId, r.role]));
+  const teamPermByRepo = new Map<string, RepoPermission>();
+  for (const row of teamPermRows) {
+    const current = teamPermByRepo.get(row.repositoryId);
+    if (!current || PERMISSION_RANK[row.permission] > PERMISSION_RANK[current]) {
+      teamPermByRepo.set(row.repositoryId, row.permission);
+    }
+  }
+
+  for (const repo of repos) {
+    if (accessibleIds.has(repo.id)) continue;
+
+    if (user.role === 'admin' && writeRequired) {
+      const collab = collabByRepo.get(repo.id);
+      if (repo.ownerId === userId || (collab != null && hasWritePermission(collab))) {
+        accessibleIds.add(repo.id);
+        continue;
+      }
+    }
+
+    if (repo.organizationId) {
+      const role = orgRoleByOrgId.get(repo.organizationId);
+      if (role === 'owner' || role === 'admin') {
+        accessibleIds.add(repo.id);
+        continue;
+      }
+      if (role === 'member' && repo.visibility === 'public' && !writeRequired) {
+        accessibleIds.add(repo.id);
+        continue;
+      }
+    }
+
+    const collabPerm = collabByRepo.get(repo.id);
+    if (collabPerm != null && satisfiesAccess(collabPerm, writeRequired)) {
+      accessibleIds.add(repo.id);
+      continue;
+    }
+
+    const teamPerm = teamPermByRepo.get(repo.id);
+    if (teamPerm != null && satisfiesAccess(teamPerm, writeRequired)) {
+      accessibleIds.add(repo.id);
+    }
+  }
+
+  return repos.filter((r) => accessibleIds.has(r.id));
 }
 
 /**

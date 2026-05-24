@@ -131,7 +131,7 @@ app.get(REGISTRY_REALM_PATH, async (c) => {
 
 // ----- v2 API -----
 
-app.get("/v2/", (c) => {
+app.get("/v2/", async (c) => {
   return c.body("", 200, {
     "Content-Length": "0",
     "Docker-Distribution-Api-Version": "registry/2.0",

@@ -46,7 +46,7 @@ app.get("/file/:username/:repo/:branch/*", async (c) => {
   });
 });
 
-app.options("/file/:username/:repo/:branch/*", (c) => {
+app.options("/file/:username/:repo/:branch/*", async (c) => {
   return new Response(null, {
     status: 204,
     headers: {

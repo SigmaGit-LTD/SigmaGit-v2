@@ -8,7 +8,7 @@ import git from "isomorphic-git";
 import { getAuth } from "../auth";
 import { putObject, deleteObject, getObject } from "../s3";
 import { createHash } from "crypto";
-import * as zlib from "zlib";
+import { deflate, inflate, inflateWithConsumedBytes } from "../lib/async-zlib";
 import { GIT_MAX_OBJECTS_PER_PUSH, GIT_MAX_DELTA_DEPTH, forceGCIfNeeded, measureMemory } from "../middleware/limits";
 import { triggerWorkflows } from "../workflows/trigger";
 import { syncWorkflows } from "../workflows/sync";
@@ -261,7 +261,7 @@ app.post("/:owner/:name/git-upload-pack", async (c) => {
     }
 
     const objects = await collectReachableObjects(store.fs, store.dir, uploadRequest.wants);
-    const pack = buildPackFile(objects);
+    const pack = await buildPackFile(objects);
     const response = Buffer.concat([Buffer.from("0008NAK\n", "ascii"), pack]);
 
     return new Response(response, {
@@ -554,7 +554,7 @@ function encodePackObjectHeader(type: number, size: number): Buffer {
   return Buffer.from(bytes);
 }
 
-function buildPackFile(objects: UploadObject[]): Buffer {
+async function buildPackFile(objects: UploadObject[]): Promise<Buffer> {
   const chunks: Buffer[] = [];
   const typeMap: Record<UploadObject["type"], number> = {
     commit: OBJ_COMMIT,
@@ -569,10 +569,16 @@ function buildPackFile(objects: UploadObject[]): Buffer {
   header.writeUInt32BE(objects.length, 8);
   chunks.push(header);
 
-  for (const object of objects) {
-    const type = typeMap[object.type];
-    const objectHeader = encodePackObjectHeader(type, object.data.length);
-    const compressed = zlib.deflateSync(object.data);
+  const objectChunks = await Promise.all(
+    objects.map(async (object) => {
+      const type = typeMap[object.type];
+      const objectHeader = encodePackObjectHeader(type, object.data.length);
+      const compressed = await deflate(object.data);
+      return [objectHeader, compressed] as const;
+    })
+  );
+
+  for (const [objectHeader, compressed] of objectChunks) {
     chunks.push(objectHeader, compressed);
   }
 
@@ -651,54 +657,6 @@ function hashObject(type: string, data: Buffer): string {
   return createHash("sha1").update(store).digest("hex");
 }
 
-function inflateObject(buf: Buffer, offset: number, expectedSize: number): { data: Buffer; bytesRead: number } {
-  const remaining = buf.subarray(offset);
-
-  try {
-    const result = zlib.inflateSync(remaining);
-
-    let consumed = 0;
-    let low = 2;
-    let high = remaining.length;
-
-    while (low <= high) {
-      const mid = Math.floor((low + high) / 2);
-      try {
-        zlib.inflateSync(remaining.subarray(0, mid));
-        consumed = mid;
-        high = mid - 1;
-      } catch {
-        low = mid + 1;
-      }
-    }
-
-    return { data: result, bytesRead: consumed || remaining.length };
-  } catch {
-    try {
-      const result = zlib.inflateRawSync(remaining);
-
-      let consumed = 0;
-      let low = 1;
-      let high = remaining.length;
-
-      while (low <= high) {
-        const mid = Math.floor((low + high) / 2);
-        try {
-          zlib.inflateRawSync(remaining.subarray(0, mid));
-          consumed = mid;
-          high = mid - 1;
-        } catch {
-          low = mid + 1;
-        }
-      }
-
-      return { data: result, bytesRead: consumed || remaining.length };
-    } catch (e) {
-      throw new Error(`Failed to inflate at offset ${offset}: ${e}`);
-    }
-  }
-}
-
 async function loadObjectFromStorage(baseOid: string, basePath: string): Promise<{ type: number; data: Buffer } | null> {
   try {
     const prefix = baseOid.substring(0, 2);
@@ -710,7 +668,7 @@ async function loadObjectFromStorage(baseOid: string, basePath: string): Promise
       return null;
     }
 
-    const decompressed = zlib.inflateSync(compressed);
+    const decompressed = await inflate(compressed);
     const nullIndex = decompressed.indexOf(0);
     if (nullIndex === -1) {
       return null;
@@ -789,7 +747,7 @@ async function unpackPackFile(
         refDeltas.push({ obj, baseOid: obj.baseOid });
       }
 
-      const inflated = inflateObject(packData, offset, header.value);
+      const inflated = await inflateWithConsumedBytes(packData, offset);
       obj.data = inflated.data;
       offset += inflated.bytesRead;
       objects.set(objOffset, obj);
@@ -1001,7 +959,7 @@ app.post("/:owner/:name/git-receive-pack", async (c) => {
 
       const header = `${type} ${data.length}\0`;
       const store = Buffer.concat([Buffer.from(header), data]);
-      const compressed = zlib.deflateSync(store);
+      const compressed = await deflate(store);
 
       await putObject(objectPath, compressed);
     };

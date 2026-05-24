@@ -1,5 +1,5 @@
 import { db, runners, workflowJobs } from '@sigmagit/db';
-import { and, eq, isNotNull, lt, or } from 'drizzle-orm';
+import { and, eq, inArray, isNotNull, lt, or } from 'drizzle-orm';
 
 const OFFLINE_THRESHOLD_MS = 2 * 60 * 1000; // 2 minutes
 const STALE_JOB_THRESHOLD_MS = 15 * 60 * 1000; // 15 minutes
@@ -32,30 +32,24 @@ async function checkRunnerHealth() {
     const offlineRunnerIds = offlineRunners.map((r) => r.id);
 
     if (offlineRunnerIds.length > 0) {
-      for (const runnerId of offlineRunnerIds) {
-        // Re-queue or fail jobs that were assigned to offline runners
-        const stalledJobs = await db
-          .update(workflowJobs)
-          .set({ status: 'failed', conclusion: 'failure', completedAt: now })
-          .where(
-            and(
-              eq(workflowJobs.runnerId, runnerId),
-              or(eq(workflowJobs.status, 'assigned'), eq(workflowJobs.status, 'in_progress'))
-            )
+      const stalledJobs = await db
+        .update(workflowJobs)
+        .set({ status: 'failed', conclusion: 'failure', completedAt: now })
+        .where(
+          and(
+            inArray(workflowJobs.runnerId, offlineRunnerIds),
+            or(eq(workflowJobs.status, 'assigned'), eq(workflowJobs.status, 'in_progress'))
           )
-          .returning({ id: workflowJobs.id });
+        )
+        .returning({ id: workflowJobs.id, runnerId: workflowJobs.runnerId });
 
-        if (stalledJobs.length > 0) {
-          console.log(
-            `[RunnerHealth] Failed ${stalledJobs.length} stalled job(s) from runner ${runnerId}`
-          );
+      if (stalledJobs.length > 0) {
+        console.log(`[RunnerHealth] Failed ${stalledJobs.length} stalled job(s) from offline runners`);
 
-          // Clear the runner's current job
-          await db
-            .update(runners)
-            .set({ currentJobId: null, updatedAt: now })
-            .where(eq(runners.id, runnerId));
-        }
+        await db
+          .update(runners)
+          .set({ currentJobId: null, updatedAt: now })
+          .where(inArray(runners.id, offlineRunnerIds));
       }
     }
 

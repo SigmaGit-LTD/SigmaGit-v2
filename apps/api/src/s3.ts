@@ -1,4 +1,4 @@
-import { getObject, putObject, deleteObject, listObjects, objectExists, deletePrefix, getObjectStream, getRepoPrefix, copyPrefix } from './storage';
+import { getObject, putObject, deleteObject, listObjects, objectExists, getObjectSize, deletePrefix, getObjectStream, getRepoPrefix, copyPrefix } from './storage';
 import { Upload } from '@aws-sdk/lib-storage';
 import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3';
 import { config } from './config';
@@ -25,7 +25,7 @@ export const s3Client = s3Configured
 
 export const bucket = config.storage.s3.bucket;
 
-export { getRepoPrefix, getObject, putObject, deleteObject, listObjects, objectExists, deletePrefix, getObjectStream, copyPrefix };
+export { getRepoPrefix, getObject, putObject, deleteObject, listObjects, objectExists, getObjectSize, deletePrefix, getObjectStream, copyPrefix };
 
 export const uploadMultipart = async (
   key: string,

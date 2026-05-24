@@ -56,6 +56,13 @@ async function connectRedis(role: RedisRole): Promise<RedisClientType | null> {
       return pool.client;
     }
     pool.isHealthy = false;
+    const staleClient = pool.client;
+    pool.client = null;
+    try {
+      await staleClient.disconnect();
+    } catch {
+      // ignore disconnect errors on stale client
+    }
   }
 
   if (pool.reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {

@@ -1,4 +1,4 @@
-import { getObject, putObject, deleteObject, listObjects, objectExists } from "../s3";
+import { getObject, putObject, deleteObject, listObjects, objectExists, getObjectSize } from "../s3";
 
 export interface S3FsStats {
   type: "file" | "dir";
@@ -126,11 +126,11 @@ export function createS3Fs(basePath: string) {
 
         const exists = await objectExists(key);
         if (exists) {
-          const data = await getObject(key);
+          const size = (await getObjectSize(key)) ?? 0;
           return {
             type: "file",
             mode: 0o100644,
-            size: data?.length || 0,
+            size,
             ino: 0,
             mtimeMs: Date.now(),
             ctimeMs: Date.now(),

@@ -100,9 +100,10 @@ app.get("/api/debug/repo/:owner/:name", authMiddleware, requireAdmin, async (c) 
 
   const prefix = `repos/${row.userId}/${row.name}/`;
   const keys = await listObjects(prefix);
+  const sampleKeys = keys.slice(0, 100);
 
   const grouped: Record<string, string[]> = {};
-  for (const key of keys) {
+  for (const key of sampleKeys) {
     const relative = key.slice(prefix.length);
     const parts = relative.split("/");
     const category = parts[0] || "root";
@@ -114,7 +115,8 @@ app.get("/api/debug/repo/:owner/:name", authMiddleware, requireAdmin, async (c) 
     prefix,
     totalFiles: keys.length,
     categories: Object.keys(grouped).map((k) => ({ name: k, count: grouped[k].length })),
-    files: keys.slice(0, 100).map((k) => k.slice(prefix.length)),
+    files: sampleKeys.map((k) => k.slice(prefix.length)),
+    truncated: keys.length > sampleKeys.length,
   });
 });
 

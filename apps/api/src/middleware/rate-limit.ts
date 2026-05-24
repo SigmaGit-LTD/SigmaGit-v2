@@ -8,6 +8,7 @@ import {
 } from 'rate-limiter-flexible';
 import { config } from '../config';
 import { getRedisSession } from '../redis';
+import { config } from '../config';
 import type { AuthVariables } from './auth';
 
 type RateLimitContext = Context<{ Variables: AuthVariables }>;
@@ -81,10 +82,23 @@ async function getLimiter(tier: RateLimitTier): Promise<RateLimiterAbstract> {
       useRedisPackage: true,
     });
   } else {
+    const memoryDuration = config.isProduction
+      ? Math.min(tierConfig.duration, 300)
+      : tierConfig.duration;
+    const memoryPoints = config.isProduction
+      ? Math.max(1, Math.floor(tierConfig.points / 4))
+      : tierConfig.points;
+
+    if (config.isProduction) {
+      console.warn(
+        `[RateLimit] Redis unavailable — using in-memory fallback for ${tier} (${memoryPoints}/${memoryDuration}s)`
+      );
+    }
+
     limiter = new RateLimiterMemory({
       keyPrefix: tierConfig.keyPrefix,
-      points: tierConfig.points,
-      duration: tierConfig.duration,
+      points: memoryPoints,
+      duration: memoryDuration,
       blockDuration: tierConfig.blockDuration,
     });
   }

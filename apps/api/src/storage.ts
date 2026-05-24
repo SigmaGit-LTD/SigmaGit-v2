@@ -19,6 +19,7 @@ export interface StorageBackend {
   put(key: string, body: Buffer | Uint8Array | string, contentType?: string): Promise<void>;
   delete(key: string): Promise<void>;
   exists(key: string): Promise<boolean>;
+  getSize(key: string): Promise<number | null>;
   list(prefix: string): Promise<string[]>;
   deletePrefix(prefix: string): Promise<void>;
   copyPrefix(sourcePrefix: string, targetPrefix: string): Promise<void>;
@@ -127,6 +128,27 @@ class S3StorageBackend implements StorageBackend {
     }
   }
 
+  async getSize(key: string): Promise<number | null> {
+    if (!this.client) {
+      return null;
+    }
+
+    try {
+      const response = await this.client.send(
+        new HeadObjectCommand({
+          Bucket: this.bucket,
+          Key: key,
+        })
+      );
+      return response.ContentLength ?? null;
+    } catch (error: any) {
+      if (error.name === 'NotFound' || error.$metadata?.httpStatusCode === 404) {
+        return null;
+      }
+      throw error;
+    }
+  }
+
   async list(prefix: string): Promise<string[]> {
     if (!this.client) {
       return [];
@@ -163,48 +185,78 @@ class S3StorageBackend implements StorageBackend {
       throw new Error('S3 is not configured');
     }
 
-    const keys = await this.list(prefix);
-
-    if (keys.length === 0) {
-      return;
-    }
-
     const BATCH_SIZE = 50;
-    for (let i = 0; i < keys.length; i += BATCH_SIZE) {
-      const batch = keys.slice(i, i + BATCH_SIZE);
-      await Promise.all(batch.map((key) => this.delete(key)));
+    let continuationToken: string | undefined;
 
-      if ((i / BATCH_SIZE) % 10 === 0) {
-        await new Promise(resolve => setTimeout(resolve, 0));
-      }
-    }
-  }
-
-  async copyPrefix(sourcePrefix: string, targetPrefix: string): Promise<void> {
-    const keys = await this.list(sourcePrefix);
-    const normalizedSource = sourcePrefix.replace(/\/$/, '');
-    const normalizedTarget = targetPrefix.replace(/\/$/, '');
-    const BATCH_SIZE = 20;
-
-    for (let i = 0; i < keys.length; i += BATCH_SIZE) {
-      const batch = keys.slice(i, i + BATCH_SIZE);
-
-      await Promise.all(
-        batch.map(async (key) => {
-          const data = await this.get(key);
-          if (!data) {
-            return;
-          }
-          const suffix = key.slice(normalizedSource.length);
-          const targetKey = `${normalizedTarget}${suffix}`;
-          await this.put(targetKey, data);
+    do {
+      const response = await this.client.send(
+        new ListObjectsV2Command({
+          Bucket: this.bucket,
+          Prefix: prefix,
+          ContinuationToken: continuationToken,
         })
       );
 
-      if ((i / BATCH_SIZE) % 10 === 0) {
-        await new Promise(resolve => setTimeout(resolve, 0));
+      const keys =
+        response.Contents?.map((obj) => obj.Key).filter((key): key is string => !!key) ?? [];
+
+      for (let i = 0; i < keys.length; i += BATCH_SIZE) {
+        const batch = keys.slice(i, i + BATCH_SIZE);
+        await Promise.all(batch.map((key) => this.delete(key)));
+
+        if ((i / BATCH_SIZE) % 10 === 0) {
+          await new Promise((resolve) => setTimeout(resolve, 0));
+        }
       }
-    }
+
+      continuationToken = response.NextContinuationToken;
+    } while (continuationToken);
+  }
+
+  async copyPrefix(sourcePrefix: string, targetPrefix: string): Promise<void> {
+    const normalizedSource = sourcePrefix.replace(/\/$/, '');
+    const normalizedTarget = targetPrefix.replace(/\/$/, '');
+    const BATCH_SIZE = 20;
+    let continuationToken: string | undefined;
+
+    do {
+      if (!this.client) {
+        throw new Error('S3 is not configured');
+      }
+
+      const response = await this.client.send(
+        new ListObjectsV2Command({
+          Bucket: this.bucket,
+          Prefix: sourcePrefix,
+          ContinuationToken: continuationToken,
+        })
+      );
+
+      const keys =
+        response.Contents?.map((obj) => obj.Key).filter((key): key is string => !!key) ?? [];
+
+      for (let i = 0; i < keys.length; i += BATCH_SIZE) {
+        const batch = keys.slice(i, i + BATCH_SIZE);
+
+        await Promise.all(
+          batch.map(async (key) => {
+            const data = await this.get(key);
+            if (!data) {
+              return;
+            }
+            const suffix = key.slice(normalizedSource.length);
+            const targetKey = `${normalizedTarget}${suffix}`;
+            await this.put(targetKey, data);
+          })
+        );
+
+        if ((i / BATCH_SIZE) % 10 === 0) {
+          await new Promise((resolve) => setTimeout(resolve, 0));
+        }
+      }
+
+      continuationToken = response.NextContinuationToken;
+    } while (continuationToken);
   }
 
   async getStream(key: string): Promise<ReadableStream | null> {
@@ -305,6 +357,20 @@ class LocalStorageBackend implements StorageBackend {
     } catch (error: any) {
       if (error.code === 'ENOENT') {
         return false;
+      }
+      throw error;
+    }
+  }
+
+  async getSize(key: string): Promise<number | null> {
+    await this.ensureBasePath();
+    try {
+      const fullPath = this.getFullPath(key);
+      const fileStat = await stat(fullPath);
+      return fileStat.size;
+    } catch (error: any) {
+      if (error.code === 'ENOENT') {
+        return null;
       }
       throw error;
     }
@@ -445,6 +511,11 @@ export const deleteObject = async (key: string): Promise<void> => {
 export const objectExists = async (key: string): Promise<boolean> => {
   const storage = getStorageBackend();
   return storage.exists(key);
+};
+
+export const getObjectSize = async (key: string): Promise<number | null> => {
+  const storage = getStorageBackend();
+  return storage.getSize(key);
 };
 
 export const listObjects = async (prefix: string): Promise<string[]> => {

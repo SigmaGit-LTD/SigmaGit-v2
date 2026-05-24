@@ -9,7 +9,7 @@ import { getAuth } from "../auth";
 import { putObject, deleteObject, getObject } from "../s3";
 import { createHash } from "crypto";
 import { deflate, inflate, inflateWithConsumedBytes } from "../lib/async-zlib";
-import { GIT_MAX_OBJECTS_PER_PUSH, GIT_MAX_DELTA_DEPTH, forceGCIfNeeded, measureMemory } from "../middleware/limits";
+import { GIT_MAX_OBJECTS_PER_PUSH, GIT_MAX_DELTA_DEPTH, GIT_MAX_UPLOAD_PACK_OBJECTS, GIT_MAX_OBJECT_BYTES, forceGCIfNeeded, measureMemory } from "../middleware/limits";
 import { triggerWorkflows } from "../workflows/trigger";
 import { syncWorkflows } from "../workflows/sync";
 
@@ -260,7 +260,17 @@ app.post("/:owner/:name/git-upload-pack", async (c) => {
       });
     }
 
-    const objects = await collectReachableObjects(store.fs, store.dir, uploadRequest.wants);
+    const haveReachable =
+      uploadRequest.haves.length > 0
+        ? await collectReachableOids(store.fs, store.dir, uploadRequest.haves)
+        : new Set<string>();
+
+    const objects = await collectReachableObjects(
+      store.fs,
+      store.dir,
+      uploadRequest.wants,
+      haveReachable
+    );
     const pack = await buildPackFile(objects);
     const response = Buffer.concat([Buffer.from("0008NAK\n", "ascii"), pack]);
 
@@ -467,7 +477,59 @@ function toObjectBuffer(object: unknown): Buffer {
   return Buffer.from([]);
 }
 
-async function collectReachableObjects(fs: any, dir: string, startOids: string[]): Promise<UploadObject[]> {
+async function collectReachableOids(fs: any, dir: string, startOids: string[]): Promise<Set<string>> {
+  const visited = new Set<string>();
+  const stack = startOids.filter((oid) => /^[0-9a-f]{40}$/i.test(oid));
+
+  const enqueue = (oid: string | undefined) => {
+    if (!oid || !/^[0-9a-f]{40}$/i.test(oid) || visited.has(oid)) {
+      return;
+    }
+    stack.push(oid);
+  };
+
+  while (stack.length > 0) {
+    const oid = stack.pop()!;
+    if (visited.has(oid)) {
+      continue;
+    }
+    visited.add(oid);
+
+    try {
+      const { type } = await git.readObject({ fs, dir, oid, format: "content" });
+      if (type === "commit") {
+        const { commit } = await git.readCommit({ fs, dir, oid });
+        enqueue(commit.tree);
+        for (const parent of commit.parent) {
+          enqueue(parent);
+        }
+      } else if (type === "tree") {
+        const { tree } = await git.readTree({ fs, dir, oid });
+        for (const entry of tree) {
+          if (entry.type === "tree" || entry.type === "commit") {
+            enqueue(entry.oid);
+          } else {
+            visited.add(entry.oid);
+          }
+        }
+      } else if (type === "tag") {
+        const { tag } = await git.readTag({ fs, dir, oid });
+        enqueue(tag.object);
+      }
+    } catch {
+      continue;
+    }
+  }
+
+  return visited;
+}
+
+async function collectReachableObjects(
+  fs: any,
+  dir: string,
+  startOids: string[],
+  excludeOids: Set<string> = new Set()
+): Promise<UploadObject[]> {
   const queued = new Set<string>(startOids);
   const stack = [...startOids];
   const visited = new Set<string>();
@@ -477,7 +539,7 @@ async function collectReachableObjects(fs: any, dir: string, startOids: string[]
     if (!oid || !/^[0-9a-f]{40}$/i.test(oid)) {
       return;
     }
-    if (visited.has(oid) || queued.has(oid)) {
+    if (visited.has(oid) || queued.has(oid) || excludeOids.has(oid)) {
       return;
     }
     queued.add(oid);
@@ -485,10 +547,15 @@ async function collectReachableObjects(fs: any, dir: string, startOids: string[]
   };
 
   while (stack.length > 0) {
+    if (objects.length >= GIT_MAX_UPLOAD_PACK_OBJECTS) {
+      console.warn(`[API] upload-pack: object limit ${GIT_MAX_UPLOAD_PACK_OBJECTS} reached`);
+      break;
+    }
+
     const oid = stack.pop()!;
     queued.delete(oid);
 
-    if (visited.has(oid)) {
+    if (visited.has(oid) || excludeOids.has(oid)) {
       continue;
     }
     visited.add(oid);
@@ -503,6 +570,10 @@ async function collectReachableObjects(fs: any, dir: string, startOids: string[]
       }
       objectType = read.type;
       objectData = toObjectBuffer(read.object);
+      if (objectData.length > GIT_MAX_OBJECT_BYTES) {
+        console.warn(`[API] upload-pack: skipping object ${oid} (${objectData.length} bytes)`);
+        continue;
+      }
       objects.push({ oid, type: objectType, data: objectData });
     } catch {
       continue;
@@ -569,17 +640,20 @@ async function buildPackFile(objects: UploadObject[]): Promise<Buffer> {
   header.writeUInt32BE(objects.length, 8);
   chunks.push(header);
 
-  const objectChunks = await Promise.all(
-    objects.map(async (object) => {
+  const COMPRESS_BATCH = 20;
+  for (let i = 0; i < objects.length; i += COMPRESS_BATCH) {
+    const batch = objects.slice(i, i + COMPRESS_BATCH);
+    for (const object of batch) {
       const type = typeMap[object.type];
       const objectHeader = encodePackObjectHeader(type, object.data.length);
       const compressed = await deflate(object.data);
-      return [objectHeader, compressed] as const;
-    })
-  );
+      chunks.push(objectHeader, compressed);
+    }
 
-  for (const [objectHeader, compressed] of objectChunks) {
-    chunks.push(objectHeader, compressed);
+    if (i > 0 && i % 200 === 0) {
+      forceGCIfNeeded();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
   }
 
   const packWithoutTrailer = Buffer.concat(chunks);
@@ -818,6 +892,8 @@ async function unpackPackFile(
 
     const objectsToStore: Array<{ oid: string; type: string; data: Buffer }> = [];
     let failed = 0;
+    let stored = 0;
+    const STORE_BATCH = 20;
 
     for (const [objOffset, obj] of objects) {
       const resolved = resolveDelta(obj);
@@ -826,38 +902,46 @@ async function unpackPackFile(
         if (failed <= 10) {
           console.error(`[API] unpack: failed to resolve delta for object at offset ${objOffset}, type=${obj.type}`);
         }
+        obj.data = Buffer.alloc(0);
+        continue;
+      }
+
+      if (resolved.data.length > GIT_MAX_OBJECT_BYTES) {
+        failed++;
+        obj.data = Buffer.alloc(0);
         continue;
       }
 
       const typeStr = typeToString(resolved.type);
       const oid = hashObject(typeStr, resolved.data);
       objectsToStore.push({ oid, type: typeStr, data: resolved.data });
+      obj.data = Buffer.alloc(0);
+
+      if (objectsToStore.length >= STORE_BATCH) {
+        const batch = objectsToStore.splice(0, STORE_BATCH);
+        await Promise.all(batch.map((item) => storeObject(item.oid, item.type, item.data)));
+        stored += batch.length;
+
+        if (stored % 500 === 0) {
+          console.log(`[API] unpack: stored ${stored} objects`);
+          forceGCIfNeeded();
+        }
+      }
     }
+
+    if (objectsToStore.length > 0) {
+      await Promise.all(objectsToStore.map((item) => storeObject(item.oid, item.type, item.data)));
+      stored += objectsToStore.length;
+    }
+
+    objects.clear();
+    baseObjects.clear();
 
     if (failed > 0) {
       console.warn(`[API] unpack: failed to resolve ${failed} objects`);
     }
 
-    console.log(`[API] unpack: storing ${objectsToStore.length} objects in parallel batches`);
-
-    const BATCH_SIZE = 50;
-    let stored = 0;
-
-    for (let i = 0; i < objectsToStore.length; i += BATCH_SIZE) {
-      const batch = objectsToStore.slice(i, i + BATCH_SIZE);
-      await Promise.all(batch.map(obj => storeObject(obj.oid, obj.type, obj.data)));
-      stored += batch.length;
-
-      if (stored % 500 === 0 || stored === objectsToStore.length) {
-        console.log(`[API] unpack: stored ${stored}/${objectsToStore.length} objects`);
-        forceGCIfNeeded();
-      }
-
-      if (stored % 1000 === 0) {
-        await new Promise(resolve => setTimeout(resolve, 0));
-      }
-    }
-
+    console.log(`[API] unpack: stored ${stored} objects`);
     return { success: true, objectCount: stored };
   } catch (error) {
     console.error("[API] unpack error:", error);

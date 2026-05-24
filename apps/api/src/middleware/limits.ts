@@ -10,7 +10,12 @@ const MEMORY_THRESHOLD = 0.92; // 92% of heap
 const MIN_HEAP_TO_ENFORCE = 1024 * 1024 * 1024; // 1 GB
 export const GIT_PUSH_SIZE_LIMIT = 100 * 1024 * 1024; // 100MB
 export const GIT_MAX_OBJECTS_PER_PUSH = 50000;
+export const GIT_MAX_UPLOAD_PACK_OBJECTS = 10000;
 export const GIT_MAX_DELTA_DEPTH = 100;
+export const GIT_MAX_OBJECT_BYTES = 10 * 1024 * 1024; // 10MB per object in pack
+export const MAX_FILE_CACHE_BYTES = 256 * 1024; // 256KB — skip Redis cache above this
+export const MAX_FILE_SERVE_BYTES = 1024 * 1024; // 1MB — refuse to load larger blobs as text
+export const MAX_COMPRESS_BYTES = 256 * 1024; // 256KB — skip gzip above this
 
 export function shouldRejectRequest(): boolean {
   try {

@@ -2,6 +2,7 @@ import git from "isomorphic-git";
 import { createS3Fs, type S3Fs } from "./s3-fs";
 import { getRepoPrefix } from "../s3";
 import { getCached, setCache, repoCache, CACHE_TTL } from "../redis";
+import { MAX_FILE_CACHE_BYTES, MAX_FILE_SERVE_BYTES } from "../middleware/limits";
 
 export interface CommitAuthor {
   name: string;
@@ -401,7 +402,20 @@ export async function getFile(
       return null;
     }
 
+    try {
+      const objectPath = `${dir}/objects/${fileEntry.oid.slice(0, 2)}/${fileEntry.oid.slice(2)}`;
+      const stats = await fs.promises.stat(objectPath);
+      if (stats.size * 8 > MAX_FILE_SERVE_BYTES) {
+        return null;
+      }
+    } catch {
+      // stat unavailable — enforce limit after read instead
+    }
+
     const { blob } = await git.readBlob({ fs, dir, oid: fileEntry.oid });
+    if (blob.length > MAX_FILE_SERVE_BYTES) {
+      return null;
+    }
     const content = new TextDecoder().decode(blob);
 
     return { content, oid: fileEntry.oid };
@@ -941,7 +955,7 @@ export async function getFileCached(
   }
 
   const file = await getFile(store.fs, store.dir, ref, filepath);
-  if (file) {
+  if (file && file.content.length <= MAX_FILE_CACHE_BYTES) {
     await setCache(cacheKey, file, CACHE_TTL.file);
   }
   return file;

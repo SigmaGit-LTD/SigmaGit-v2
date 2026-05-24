@@ -1,5 +1,6 @@
 import { createMiddleware } from 'hono/factory';
 import { gzip } from 'node:zlib/promises';
+import { MAX_COMPRESS_BYTES } from './limits';
 
 const COMPRESSIBLE = /^application\/(json|javascript|xml)|^text\//i;
 const MIN_SIZE = 1024;
@@ -31,8 +32,18 @@ export const compressionMiddleware = createMiddleware(async (c, next) => {
     return;
   }
 
+  const contentLengthHeader = c.res.headers.get('content-length');
+  if (contentLengthHeader) {
+    const contentLength = parseInt(contentLengthHeader, 10);
+    if (!Number.isNaN(contentLength)) {
+      if (contentLength < MIN_SIZE || contentLength > MAX_COMPRESS_BYTES) {
+        return;
+      }
+    }
+  }
+
   const body = await c.res.arrayBuffer();
-  if (body.byteLength < MIN_SIZE) {
+  if (body.byteLength < MIN_SIZE || body.byteLength > MAX_COMPRESS_BYTES) {
     return;
   }
 

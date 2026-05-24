@@ -2,6 +2,7 @@ import { createMiddleware } from "hono/factory";
 import { getAuth, type Session } from "../auth";
 import { db, users } from "@sigmagit/db";
 import { eq } from "drizzle-orm";
+import { appCache, CACHE_TTL, getCached, setCache } from "../redis";
 
 export type AuthUser = {
   id: string;
@@ -20,41 +21,8 @@ export type AuthVariables = {
 
 export type AdminVariables = AuthVariables;
 
-const USER_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
-const USER_CACHE_MAX_SIZE = 10_000;
-const userCache = new Map<string, { user: AuthUser; expiresAt: number }>();
-
-// Periodic cleanup to prevent memory leaks
-setInterval(() => {
-  const now = Date.now();
-  for (const [key, entry] of userCache) {
-    if (entry.expiresAt < now) {
-      userCache.delete(key);
-    }
-  }
-}, 60_000);
-
-function getCachedUser(userId: string): AuthUser | null {
-  const entry = userCache.get(userId);
-  if (!entry) return null;
-  if (entry.expiresAt < Date.now()) {
-    userCache.delete(userId);
-    return null;
-  }
-  return entry.user;
-}
-
-function cacheUser(userId: string, user: AuthUser) {
-  if (userCache.size >= USER_CACHE_MAX_SIZE) {
-    // Evict oldest entry (first in Map iteration order)
-    const oldest = userCache.keys().next().value;
-    if (oldest) userCache.delete(oldest);
-  }
-  userCache.set(userId, { user, expiresAt: Date.now() + USER_CACHE_TTL });
-}
-
-export function invalidateCachedUser(userId: string) {
-  userCache.delete(userId);
+export async function invalidateCachedUser(userId: string): Promise<void> {
+  await appCache.invalidateUser(userId);
 }
 
 export const authMiddleware = createMiddleware<{ Variables: AuthVariables }>(async (c, next) => {
@@ -66,7 +34,7 @@ export const authMiddleware = createMiddleware<{ Variables: AuthVariables }>(asy
     });
 
     if (session?.user) {
-      const cached = getCachedUser(session.user.id);
+      const cached = await getCached<AuthUser>(appCache.userKey(session.user.id));
 
       if (cached) {
         c.set("user", cached);
@@ -92,7 +60,7 @@ export const authMiddleware = createMiddleware<{ Variables: AuthVariables }>(asy
           role: dbUser?.role || (session.user as any).role || "user",
         };
 
-        cacheUser(session.user.id, user);
+        await setCache(appCache.userKey(session.user.id), user, CACHE_TTL.user);
         c.set("user", user);
       }
 

@@ -5,6 +5,7 @@ import { db, users, repositories, organizations, systemSettings } from "@sigmagi
 import { eq, and } from "drizzle-orm";
 import { config } from "../config";
 import { authMiddleware, requireAdmin, type AuthVariables } from "../middleware/auth";
+import { appCache, CACHE_TTL, getCached, setCache } from "../redis";
 
 const app = new Hono<{ Variables: AuthVariables }>();
 
@@ -18,17 +19,39 @@ app.get("/api/health", (c) => {
 
 // Public status (maintenance mode) - no auth, so app can gate non-admin users
 app.get("/api/status", async (c) => {
+  const cached = await getCached<{ maintenanceMode: boolean }>(appCache.systemSettingKey("maintenance_mode"));
+  if (cached) {
+    return c.json(cached);
+  }
+
   const row = await db
     .select({ value: systemSettings.value })
     .from(systemSettings)
     .where(eq(systemSettings.key, "maintenance_mode"))
     .limit(1);
   const maintenanceMode = row[0]?.value === true;
-  return c.json({ maintenanceMode: !!maintenanceMode });
+  const payload = { maintenanceMode: !!maintenanceMode };
+  await setCache(appCache.systemSettingKey("maintenance_mode"), payload, CACHE_TTL.systemSetting);
+  return c.json(payload);
 });
 
 // Public platform stats (no auth) - mounted on health so it is never behind admin/auth middleware
 app.get("/api/stats/platform", async (c) => {
+  const cached = await getCached<{
+    developers: number;
+    repositories: number;
+    organizations: number;
+    uptimeSeconds: number;
+    generatedAt: string;
+  }>(appCache.platformStatsKey());
+
+  if (cached) {
+    return c.json({
+      ...cached,
+      uptimeSeconds: Math.floor(process.uptime()),
+    });
+  }
+
   const [userCountRow, publicRepoCountRow, organizationCountRow] = await Promise.all([
     db.select({ count: sql<number>`COUNT(*)::int` }).from(users),
     db
@@ -38,13 +61,16 @@ app.get("/api/stats/platform", async (c) => {
     db.select({ count: sql<number>`COUNT(*)::int` }).from(organizations),
   ]);
 
-  return c.json({
+  const payload = {
     developers: Number(userCountRow[0]?.count ?? 0),
     repositories: Number(publicRepoCountRow[0]?.count ?? 0),
     organizations: Number(organizationCountRow[0]?.count ?? 0),
     uptimeSeconds: Math.floor(process.uptime()),
     generatedAt: new Date().toISOString(),
-  });
+  };
+
+  await setCache(appCache.platformStatsKey(), payload, CACHE_TTL.platformStats);
+  return c.json(payload);
 });
 
 app.get("/api/debug/repo/:owner/:name", authMiddleware, requireAdmin, async (c) => {

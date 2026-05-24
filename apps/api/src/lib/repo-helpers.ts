@@ -2,6 +2,7 @@ import { db, repositories, organizations, users } from '@sigmagit/db';
 import { eq, and, isNull } from 'drizzle-orm';
 import { createGitStore, type GitStore } from '../git';
 import { canAccessRepository, type AccessUser } from './access';
+import { appCache, CACHE_TTL, getCached, setCache } from '../redis';
 
 export function getStorageOwnerId(repo: { ownerId: string; organizationId?: string | null }): string {
   return repo.organizationId ?? repo.ownerId;
@@ -21,12 +22,17 @@ export type ResolvedRepo = {
   ownerDisplay: string;
 };
 
-export async function resolveRepositoryBySlug(
+export async function invalidateRepositorySlugCache(
   ownerSlug: string,
   repoName: string
-): Promise<ResolvedRepo | null> {
-  const normalizedRepoName = repoName.replace(/\.git$/, '');
+): Promise<void> {
+  await appCache.invalidateRepoSlug(ownerSlug, repoName);
+}
 
+async function lookupRepositoryBySlug(
+  ownerSlug: string,
+  normalizedRepoName: string
+): Promise<ResolvedRepo | null> {
   const orgResult = await db
     .select({
       id: repositories.id,
@@ -102,6 +108,26 @@ export async function resolveRepositoryBySlug(
     ownerType: 'user',
     ownerDisplay: userRow.userName || userRow.username,
   };
+}
+
+export async function resolveRepositoryBySlug(
+  ownerSlug: string,
+  repoName: string
+): Promise<ResolvedRepo | null> {
+  const normalizedRepoName = repoName.replace(/\.git$/, '');
+  const cacheKey = appCache.repoSlugKey(ownerSlug, normalizedRepoName);
+
+  const cached = await getCached<ResolvedRepo>(cacheKey);
+  if (cached) {
+    return cached;
+  }
+
+  const repo = await lookupRepositoryBySlug(ownerSlug, normalizedRepoName);
+  if (repo) {
+    await setCache(cacheKey, repo, CACHE_TTL.repoSlug);
+  }
+
+  return repo;
 }
 
 export function createRepoGitStore(repo: ResolvedRepo): GitStore {

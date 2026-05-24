@@ -3,6 +3,7 @@ import { db, users, repositories, stars, organizations, organizationMembers, tea
 import { eq, sql, desc, asc, and, inArray } from "drizzle-orm";
 import { authMiddleware, requireAuth, type AuthVariables } from "../middleware/auth";
 import { parseLimit, parseOffset } from "../lib/validation";
+import { appCache, CACHE_TTL, getCached, setCache } from "../redis";
 
 const app = new Hono<{ Variables: AuthVariables }>();
 
@@ -10,6 +11,12 @@ const app = new Hono<{ Variables: AuthVariables }>();
 /** Resolve username to either a user or organization in one request. Prefers organization when both exist. */
 app.get("/api/users/:username/resolve", async (c) => {
   const username = c.req.param("username");
+  const cacheKey = appCache.profileResolveKey(username);
+  const currentUser = c.get("user");
+  const cached = await getCached<{ type: string; profile?: { id?: string } }>(cacheKey);
+  if (cached && !(cached.type === "user" && cached.profile?.id === currentUser?.id)) {
+    return c.json(cached);
+  }
 
   const [orgRow, userRow] = await Promise.all([
     db.select().from(organizations).where(eq(organizations.name, username)).limit(1),
@@ -45,7 +52,7 @@ app.get("/api/users/:username/resolve", async (c) => {
       db.select({ count: sql<number>`COUNT(*)` }).from(repositories).where(eq(repositories.organizationId, org.id)),
       db.select({ count: sql<number>`COUNT(*)` }).from(teams).where(eq(teams.organizationId, org.id)),
     ]);
-    return c.json({
+    const payload = {
       type: "organization" as const,
       profile: {
         ...org,
@@ -53,11 +60,12 @@ app.get("/api/users/:username/resolve", async (c) => {
         repoCount: Number(repoCount[0]?.count) || 0,
         teamCount: Number(teamCount[0]?.count) || 0,
       },
-    });
+    };
+    await setCache(cacheKey, payload, CACHE_TTL.profileResolve);
+    return c.json(payload);
   }
 
   if (user) {
-    const currentUser = c.get("user");
     const isOwnProfile = currentUser?.id === user.id;
     const response: Record<string, unknown> = {
       id: user.id,
@@ -77,6 +85,9 @@ app.get("/api/users/:username/resolve", async (c) => {
     if (isOwnProfile) {
       response.email = user.email;
       response.emailVerified = user.emailVerified;
+    } else {
+      const payload = { type: "user" as const, profile: response };
+      await setCache(cacheKey, payload, CACHE_TTL.profileResolve);
     }
     return c.json({ type: "user" as const, profile: response });
   }

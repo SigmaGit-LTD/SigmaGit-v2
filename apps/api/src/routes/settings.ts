@@ -2,6 +2,7 @@ import { Hono } from "hono";
 import { db, users, repositories, accounts, userSshKeys } from "@sigmagit/db";
 import { eq, ne, and, isNull } from "drizzle-orm";
 import { authMiddleware, requireAuth, invalidateCachedUser, type AuthVariables } from "../middleware/auth";
+import { appCache } from "../redis";
 import { config } from "../config";
 import { putObject, deleteObject, deletePrefix, getRepoPrefix } from "../s3";
 import { isPasswordCompromised } from "../security/pwned";
@@ -184,6 +185,14 @@ app.patch("/api/settings/profile", requireAuth, async (c) => {
       updatedAt: new Date(),
     })
     .where(eq(users.id, user.id));
+
+  await invalidateCachedUser(user.id);
+  if (currentUser?.username && currentUser.username !== finalUsername) {
+    await appCache.invalidateProfileResolve(currentUser.username);
+  }
+  if (finalUsername) {
+    await appCache.invalidateProfileResolve(finalUsername);
+  }
 
   return c.json({ success: true, username: finalUsername });
 });

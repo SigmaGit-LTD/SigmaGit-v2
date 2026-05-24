@@ -7,7 +7,7 @@ import { apiKey, haveIBeenPwned } from 'better-auth/plugins';
 import { APIError } from 'better-auth/api';
 import { expo } from '@better-auth/expo';
 import { betterAuth } from 'better-auth';
-import { getRedis } from './redis';
+import { getRedisSession } from './redis';
 
 function getCookieDomain(): string | undefined {
   try {
@@ -298,7 +298,7 @@ export const initAuth = async () => {
   }
 
   authInitPromise = (async () => {
-    const redis = await getRedis();
+    const redis = await getRedisSession();
     const apiUrl = getApiUrl();
     const githubEnabled = Boolean(config.github.clientId && config.github.clientSecret);
 

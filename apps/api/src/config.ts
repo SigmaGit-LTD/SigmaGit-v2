@@ -26,7 +26,8 @@ function isProductionEnv(): boolean {
 export const config = {
   port: parseInt(process.env.PORT || '3001', 10),
   databaseUrl: process.env.DATABASE_URL!,
-  redisUrl: process.env.REDIS_URL,
+  redisSessionUrl: process.env.REDIS_SESSION_URL || process.env.REDIS_URL,
+  redisCacheUrl: process.env.REDIS_CACHE_URL || process.env.REDIS_URL,
   webhooksEnabled: process.env.ENABLE_WEBHOOKS !== 'false',
   discordWebhookSecret: process.env.DISCORD_WEBHOOK_SECRET || process.env.WEBHOOK_SECRET || null,
   enableMigrations: process.env.ENABLE_MIGRATIONS !== 'false',

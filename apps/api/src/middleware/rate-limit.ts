@@ -7,7 +7,7 @@ import {
   RateLimiterRes,
 } from 'rate-limiter-flexible';
 import { config } from '../config';
-import { getRedis } from '../redis';
+import { getRedisSession } from '../redis';
 import type { AuthVariables } from './auth';
 
 type RateLimitContext = Context<{ Variables: AuthVariables }>;
@@ -67,7 +67,7 @@ async function getLimiter(tier: RateLimitTier): Promise<RateLimiterAbstract> {
   if (existing) return existing;
 
   const tierConfig = RATE_LIMIT_CONFIGS[tier];
-  const redis = await getRedis();
+  const redis = await getRedisSession();
 
   let limiter: RateLimiterAbstract;
 

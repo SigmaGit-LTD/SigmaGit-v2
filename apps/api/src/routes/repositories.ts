@@ -6,7 +6,7 @@ import { requireAuth, type AuthVariables } from "../middleware/auth";
 import { writeRateLimit } from "../middleware/rate-limit";
 import { parseLimit, parseOffset } from "../lib/validation";
 import { canAccessRepository } from "../lib/access";
-import { resolveRepositoryBySlug, getStorageOwnerId } from "../lib/repo-helpers";
+import { resolveRepositoryBySlug, getStorageOwnerId, invalidateRepositorySlugCache } from "../lib/repo-helpers";
 import { putObject, deletePrefix, getRepoPrefix, copyPrefix, listObjects } from "../s3";
 import { repoCache } from "../redis";
 import { createGitStore } from "../git";
@@ -933,7 +933,23 @@ app.delete("/api/repositories/:id", requireAuth, async (c) => {
   await deletePrefix(repoPrefix);
   console.log(`[API] Deleted all objects for repository`);
 
-  await repoCache.invalidateRepo(user.id, repo.name);
+  await repoCache.invalidateRepo(getStorageOwnerId(repo), repo.name);
+  const owner = await db.query.users.findFirst({
+    where: eq(users.id, repo.ownerId),
+    columns: { username: true },
+  });
+  if (owner?.username) {
+    await invalidateRepositorySlugCache(owner.username, repo.name);
+  }
+  if (repo.organizationId) {
+    const org = await db.query.organizations.findFirst({
+      where: eq(organizations.id, repo.organizationId),
+      columns: { name: true },
+    });
+    if (org?.name) {
+      await invalidateRepositorySlugCache(org.name, repo.name);
+    }
+  }
   console.log(`[API] Invalidated Redis cache for repository`);
 
   await db.delete(repositories).where(eq(repositories.id, id));
@@ -996,6 +1012,32 @@ app.patch("/api/repositories/:id", requireAuth, async (c) => {
     })
     .where(eq(repositories.id, id))
     .returning();
+
+  if (newName !== repo.name || nextVisibility !== repo.visibility) {
+    await repoCache.invalidateRepo(getStorageOwnerId(repo), repo.name);
+    const owner = await db.query.users.findFirst({
+      where: eq(users.id, repo.ownerId),
+      columns: { username: true },
+    });
+    if (owner?.username) {
+      await invalidateRepositorySlugCache(owner.username, repo.name);
+      if (newName !== repo.name) {
+        await invalidateRepositorySlugCache(owner.username, newName);
+      }
+    }
+    if (repo.organizationId) {
+      const org = await db.query.organizations.findFirst({
+        where: eq(organizations.id, repo.organizationId),
+        columns: { name: true },
+      });
+      if (org?.name) {
+        await invalidateRepositorySlugCache(org.name, repo.name);
+        if (newName !== repo.name) {
+          await invalidateRepositorySlugCache(org.name, newName);
+        }
+      }
+    }
+  }
 
   return c.json(updated);
 });

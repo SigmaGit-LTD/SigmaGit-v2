@@ -2,7 +2,7 @@ import { Hono } from "hono";
 import { createMiddleware } from "hono/factory";
 import { config, getAllowedOrigins } from "./config";
 import { initAuth } from "./auth";
-import { getRedis } from "./redis";
+import { getRedisSession, getRedisCache } from "./redis";
 import { mountRoutes } from "./routes";
 import { handleWebSocketUpgrade, websocketHandlers } from "./websocket";
 import {
@@ -20,16 +20,26 @@ import { startMigrationWorker } from "./workers/migration";
 import { startRunnerHealthWorker } from "./workers/runner-health";
 import "./monitoring";
 
-if (config.redisUrl) {
-  const redis = await getRedis();
-  if (redis) {
-    const role = await redis.info("replication").then(info => info.includes("role:master") ? "master" : "replica").catch(() => "unknown");
-    console.log(`[Redis] Connected successfully (role: ${role})`);
+if (config.redisSessionUrl) {
+  const sessionRedis = await getRedisSession();
+  if (sessionRedis) {
+    console.log("[Redis:session] Connected successfully");
   } else {
-    console.log("[Redis] Connection failed, will retry on first request");
+    console.log("[Redis:session] Connection failed, will retry on first request");
   }
-} else {
-  console.log("[Redis] REDIS_URL not configured, running without cache");
+}
+
+if (config.redisCacheUrl) {
+  const cacheRedis = await getRedisCache();
+  if (cacheRedis) {
+    console.log("[Redis:cache] Connected successfully");
+  } else {
+    console.log("[Redis:cache] Connection failed, will retry on first request");
+  }
+}
+
+if (!config.redisSessionUrl && !config.redisCacheUrl) {
+  console.log("[Redis] REDIS_SESSION_URL / REDIS_CACHE_URL not configured, running without cache");
 }
 
 const app = new Hono();

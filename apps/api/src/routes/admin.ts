@@ -22,9 +22,10 @@ import {
 import { eq, sql, desc, count, and, or, ilike, gte, lte, inArray, lt, notInArray } from "drizzle-orm";
 import { authMiddleware, requireAdmin, invalidateCachedUser, type AuthVariables } from "../middleware/auth";
 import { parseLimit, parseOffset } from "../lib/validation";
-import { repoCache } from "../redis";
+import { repoCache, appCache } from "../redis";
 import { createGitStore, getCommitCountCached, listBranchesCached } from "../git";
 import { copyPrefix, deletePrefix, getRepoPrefix } from "../s3";
+import { getStorageOwnerId, invalidateRepositorySlugCache } from "../lib/repo-helpers";
 
 const app = new Hono<{ Variables: AuthVariables }>();
 
@@ -105,8 +106,11 @@ async function invalidateRepositoryCaches(
     }
   }
 
+  await repoCache.invalidateRepo(getStorageOwnerId(repository), repository.name);
   await Promise.all(
-    Array.from(ownerNames).map((ownerName) => repoCache.invalidateRepo(ownerName, repository.name))
+    Array.from(ownerNames).map((ownerName) =>
+      invalidateRepositorySlugCache(ownerName, repository.name)
+    )
   );
 }
 
@@ -612,7 +616,7 @@ app.patch("/api/admin/users/:id", async (c) => {
   }
 
   await db.update(users).set(updates).where(eq(users.id, id));
-  invalidateCachedUser(id);
+  await invalidateCachedUser(id);
 
   await logAuditEvent(
     actor.id,
@@ -849,9 +853,10 @@ app.post("/api/admin/repositories/:id/transfer", async (c) => {
       )?.username;
 
   if (oldOwnerName) {
-    await repoCache.invalidateRepo(oldOwnerName, existingRepo.name);
+    await repoCache.invalidateRepo(getStorageOwnerId(existingRepo), existingRepo.name);
+    await invalidateRepositorySlugCache(oldOwnerName, existingRepo.name);
   }
-  await repoCache.invalidateRepo(newOwner.username, existingRepo.name);
+  await invalidateRepositorySlugCache(newOwner.username, existingRepo.name);
 
   await logAuditEvent(
     actor.id,
@@ -1080,6 +1085,8 @@ app.patch("/api/admin/settings", async (c) => {
           updatedAt: new Date(),
         },
       });
+
+    await appCache.invalidateSystemSetting(key);
   }
 
   await logAuditEvent(
@@ -1114,6 +1121,8 @@ app.post("/api/admin/maintenance", async (c) => {
         updatedAt: new Date(),
       },
     });
+
+  await appCache.invalidateSystemSetting("maintenance_mode");
 
   await logAuditEvent(
     actor.id,

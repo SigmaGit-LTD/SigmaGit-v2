@@ -1,13 +1,23 @@
-import { createClient, type RedisClientType } from "redis";
-import { config } from "./config";
+import { createClient, type RedisClientType } from 'redis';
+import { config } from './config';
 
-let redis: RedisClientType | null = null;
-let reconnectAttempts = 0;
-let lastHealthCheck = 0;
-let isRedisHealthy = false;
+type RedisRole = 'session' | 'cache';
+
+interface RedisPool {
+  client: RedisClientType | null;
+  reconnectAttempts: number;
+  lastHealthCheck: number;
+  isHealthy: boolean;
+}
+
 const HEALTH_CHECK_INTERVAL = 5_000;
 const MAX_RECONNECT_ATTEMPTS = 5;
 const INITIAL_RECONNECT_DELAY = 1000;
+
+const pools: Record<RedisRole, RedisPool> = {
+  session: { client: null, reconnectAttempts: 0, lastHealthCheck: 0, isHealthy: false },
+  cache: { client: null, reconnectAttempts: 0, lastHealthCheck: 0, isHealthy: false },
+};
 
 async function isHealthy(client: RedisClientType): Promise<boolean> {
   try {
@@ -18,41 +28,52 @@ async function isHealthy(client: RedisClientType): Promise<boolean> {
   }
 }
 
-export const getRedis = async (): Promise<RedisClientType | null> => {
-  if (!config.redisUrl) {
+function getRedisUrl(role: RedisRole): string | undefined {
+  if (role === 'session') {
+    return config.redisSessionUrl;
+  }
+  return config.redisCacheUrl;
+}
+
+async function connectRedis(role: RedisRole): Promise<RedisClientType | null> {
+  const url = getRedisUrl(role);
+  if (!url) {
     return null;
   }
 
-  if (redis) {
+  const pool = pools[role];
+
+  if (pool.client) {
     const now = Date.now();
-    if (isRedisHealthy && (now - lastHealthCheck) < HEALTH_CHECK_INTERVAL) {
-      return redis;
+    if (pool.isHealthy && now - pool.lastHealthCheck < HEALTH_CHECK_INTERVAL) {
+      return pool.client;
     }
 
-    lastHealthCheck = now;
-    if (await isHealthy(redis)) {
-      isRedisHealthy = true;
-      reconnectAttempts = 0;
-      return redis;
+    pool.lastHealthCheck = now;
+    if (await isHealthy(pool.client)) {
+      pool.isHealthy = true;
+      pool.reconnectAttempts = 0;
+      return pool.client;
     }
-    isRedisHealthy = false;
+    pool.isHealthy = false;
   }
 
-  if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
-    console.error("[Redis] Max reconnection attempts reached, giving up");
+  if (pool.reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+    console.error(`[Redis:${role}] Max reconnection attempts reached, giving up`);
     return null;
   }
 
-  const delay = INITIAL_RECONNECT_DELAY * Math.pow(2, reconnectAttempts);
-
-  if (reconnectAttempts > 0) {
-    console.log(`[Redis] Reconnection attempt ${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS}, delay ${delay}ms`);
-    await new Promise(resolve => setTimeout(resolve, delay));
+  const delay = INITIAL_RECONNECT_DELAY * Math.pow(2, pool.reconnectAttempts);
+  if (pool.reconnectAttempts > 0) {
+    console.log(
+      `[Redis:${role}] Reconnection attempt ${pool.reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS}, delay ${delay}ms`
+    );
+    await new Promise((resolve) => setTimeout(resolve, delay));
   }
 
   try {
     const newClient = createClient({
-      url: config.redisUrl,
+      url,
       socket: {
         connectTimeout: 3000,
         reconnectStrategy: false,
@@ -61,31 +82,43 @@ export const getRedis = async (): Promise<RedisClientType | null> => {
 
     await newClient.connect();
 
-    redis = newClient as RedisClientType;
-    reconnectAttempts = 0;
-    isRedisHealthy = true;
-    lastHealthCheck = Date.now();
-    console.log("[Redis] Connected successfully");
-    return redis;
+    pool.client = newClient as RedisClientType;
+    pool.reconnectAttempts = 0;
+    pool.isHealthy = true;
+    pool.lastHealthCheck = Date.now();
+    console.log(`[Redis:${role}] Connected successfully`);
+    return pool.client;
   } catch (error) {
-    reconnectAttempts++;
-    console.error(`[Redis] Connection attempt ${reconnectAttempts} failed:`, error instanceof Error ? error.message : "Unknown error");
-    redis = null;
+    pool.reconnectAttempts++;
+    console.error(
+      `[Redis:${role}] Connection attempt ${pool.reconnectAttempts} failed:`,
+      error instanceof Error ? error.message : 'Unknown error'
+    );
+    pool.client = null;
     return null;
   }
-};
+}
 
-/** @deprecated Use getRedis() */
-export const getRedisClient = getRedis;
+/** Session/operational Redis — auth sessions, rate limits, challenges. */
+export const getRedisSession = (): Promise<RedisClientType | null> => connectRedis('session');
+
+/** Cache Redis — git metadata, API response cache, repo/user lookups. */
+export const getRedisCache = (): Promise<RedisClientType | null> => connectRedis('cache');
+
+/** @deprecated Use getRedisSession() */
+export const getRedis = getRedisSession;
+
+/** @deprecated Use getRedisSession() */
+export const getRedisClient = getRedisSession;
 
 export const initializeRedis = async (): Promise<RedisClientType> => {
-  if (!config.redisUrl) {
-    throw new Error("REDIS_URL is not configured");
+  if (!config.redisSessionUrl) {
+    throw new Error('REDIS_SESSION_URL (or REDIS_URL) is not configured');
   }
 
-  const client = await getRedis();
+  const client = await getRedisSession();
   if (!client) {
-    throw new Error("Failed to connect to Redis");
+    throw new Error('Failed to connect to Redis session store');
   }
 
   return client;
@@ -99,14 +132,19 @@ export const CACHE_TTL = {
   tree: 60 * 30,
   file: 60 * 60,
   commits: 60 * 10,
+  user: 60 * 5,
+  repoSlug: 60 * 5,
+  platformStats: 60,
+  systemSetting: 30,
+  profileResolve: 60 * 2,
 } as const;
 
 function cacheKey(type: string, ...parts: string[]): string {
-  return `sigmagit:${type}:${parts.join(":")}`;
+  return `sigmagit:${type}:${parts.join(':')}`;
 }
 
 export async function getCached<T>(key: string): Promise<T | null> {
-  const client = await getRedis();
+  const client = await getRedisCache();
   if (!client) return null;
 
   try {
@@ -121,7 +159,7 @@ export async function getCached<T>(key: string): Promise<T | null> {
 }
 
 export async function setCache<T>(key: string, value: T, ttl: number): Promise<void> {
-  const client = await getRedis();
+  const client = await getRedisCache();
   if (!client) return;
 
   try {
@@ -132,7 +170,7 @@ export async function setCache<T>(key: string, value: T, ttl: number): Promise<v
 }
 
 export async function deleteCache(key: string): Promise<void> {
-  const client = await getRedis();
+  const client = await getRedisCache();
   if (!client) return;
 
   try {
@@ -143,7 +181,7 @@ export async function deleteCache(key: string): Promise<void> {
 }
 
 export async function deleteCachePattern(pattern: string): Promise<void> {
-  const client = await getRedis();
+  const client = await getRedisCache();
   if (!client) return;
 
   try {
@@ -176,24 +214,51 @@ export async function deleteCachePattern(pattern: string): Promise<void> {
   }
 }
 
+export const appCache = {
+  userKey: (userId: string) => cacheKey('user', userId),
+  repoSlugKey: (ownerSlug: string, repoName: string) =>
+    cacheKey('repo-slug', ownerSlug, repoName.replace(/\.git$/, '')),
+  platformStatsKey: () => cacheKey('platform-stats'),
+  systemSettingKey: (key: string) => cacheKey('system', key),
+  profileResolveKey: (username: string) => cacheKey('profile-resolve', username),
+
+  async invalidateUser(userId: string): Promise<void> {
+    await deleteCache(appCache.userKey(userId));
+  },
+
+  async invalidateRepoSlug(ownerSlug: string, repoName: string): Promise<void> {
+    await deleteCache(appCache.repoSlugKey(ownerSlug, repoName));
+  },
+
+  async invalidatePlatformStats(): Promise<void> {
+    await deleteCache(appCache.platformStatsKey());
+  },
+
+  async invalidateSystemSetting(key: string): Promise<void> {
+    await deleteCache(appCache.systemSettingKey(key));
+  },
+
+  async invalidateProfileResolve(username: string): Promise<void> {
+    await deleteCache(appCache.profileResolveKey(username));
+  },
+};
+
 export const repoCache = {
-  branchesKey: (userId: string, repoName: string) =>
-    cacheKey("branches", userId, repoName),
+  branchesKey: (userId: string, repoName: string) => cacheKey('branches', userId, repoName),
 
   commitsKey: (userId: string, repoName: string, branch: string, limit: number, skip: number) =>
-    cacheKey("commits", userId, repoName, branch, String(limit), String(skip)),
+    cacheKey('commits', userId, repoName, branch, String(limit), String(skip)),
 
   commitCountKey: (userId: string, repoName: string, branch: string) =>
-    cacheKey("commit-count", userId, repoName, branch),
+    cacheKey('commit-count', userId, repoName, branch),
 
   treeKey: (userId: string, repoName: string, branch: string, path: string) =>
-    cacheKey("tree", userId, repoName, branch, path || "root"),
+    cacheKey('tree', userId, repoName, branch, path || 'root'),
 
   fileKey: (userId: string, repoName: string, branch: string, path: string) =>
-    cacheKey("file", userId, repoName, branch, path),
+    cacheKey('file', userId, repoName, branch, path),
 
-  refKey: (userId: string, repoName: string, ref: string) =>
-    cacheKey("ref", userId, repoName, ref),
+  refKey: (userId: string, repoName: string, ref: string) => cacheKey('ref', userId, repoName, ref),
 
   async invalidateRepo(userId: string, repoName: string): Promise<void> {
     await deleteCachePattern(`sigmagit:*:${userId}:${repoName}:*`);
@@ -209,4 +274,3 @@ export const repoCache = {
     await deleteCache(repoCache.branchesKey(userId, repoName));
   },
 };
-

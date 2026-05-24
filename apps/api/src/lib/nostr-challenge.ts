@@ -1,11 +1,11 @@
-import { getRedis } from '../redis';
+import { getRedisSession } from '../redis';
 
 const CHALLENGE_TTL_SEC = 300;
 const CHALLENGE_PREFIX = 'nostr:challenge:';
 
 export async function createNostrChallenge(): Promise<string> {
   const challenge = crypto.randomUUID();
-  const redis = await getRedis();
+  const redis = await getRedisSession();
   if (redis) {
     await redis.set(`${CHALLENGE_PREFIX}${challenge}`, '1', { EX: CHALLENGE_TTL_SEC });
   }
@@ -13,7 +13,7 @@ export async function createNostrChallenge(): Promise<string> {
 }
 
 export async function consumeNostrChallenge(challenge: string): Promise<boolean> {
-  const redis = await getRedis();
+  const redis = await getRedisSession();
   if (!redis) {
     console.warn('[Nostr] Redis unavailable — challenge validation skipped');
     return false;

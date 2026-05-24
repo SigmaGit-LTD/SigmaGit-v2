@@ -17,12 +17,26 @@ services:
     networks:
       - sigmagit
 
-  redis:
+  redis-session:
     image: redis:7-alpine
     restart: unless-stopped
     command: redis-server --appendonly yes
     volumes:
-      - redis_data:/data
+      - redis_session_data:/data
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - sigmagit
+
+  redis-cache:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: redis-server --maxmemory 512mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_cache_data:/data
     healthcheck:
       test: ['CMD', 'redis-cli', 'ping']
       interval: 10s
@@ -40,12 +54,15 @@ services:
       - .env
     environment:
       TRUST_PROXY: 'true'
-      REDIS_URL: redis://redis:6379
+      REDIS_SESSION_URL: redis://redis-session:6379
+      REDIS_CACHE_URL: redis://redis-cache:6379
       DATABASE_URL: postgresql://sigmagit:${POSTGRES_PASSWORD:-sigmagit}@postgres:5432/sigmagit
     depends_on:
       postgres:
         condition: service_healthy
-      redis:
+      redis-session:
+        condition: service_healthy
+      redis-cache:
         condition: service_healthy
     expose:
       - '3001'
@@ -100,6 +117,7 @@ networks:
 
 volumes:
   postgres_data:
-  redis_data:
+  redis_session_data:
+  redis_cache_data:
   caddy_data:
   caddy_config:

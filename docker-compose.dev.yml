@@ -3,9 +3,13 @@ services:
     ports:
       - '5432:5432'
 
-  redis:
+  redis-session:
     ports:
       - '6379:6379'
+
+  redis-cache:
+    ports:
+      - '6380:6379'
 
   api:
     ports:

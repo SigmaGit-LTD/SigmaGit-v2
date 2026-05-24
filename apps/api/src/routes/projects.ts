@@ -11,33 +11,10 @@ import {
 } from "@sigmagit/db";
 import { eq, sql, and, asc, inArray } from "drizzle-orm";
 import { requireAuth, type AuthVariables } from "../middleware/auth";
-import { canAccessRepository } from "../lib/access";
+import { canManageRepository } from "../lib/access";
+import { resolveRepositoryWithAccess } from "../lib/repo-helpers";
 
 const app = new Hono<{ Variables: AuthVariables }>();
-
-async function getRepoAndCheckAccess(owner: string, name: string, user?: { id: string; role?: string } | null) {
-  const result = await db
-    .select({
-      id: repositories.id,
-      ownerId: repositories.ownerId,
-      visibility: repositories.visibility,
-    })
-    .from(repositories)
-    .innerJoin(users, eq(users.id, repositories.ownerId))
-    .where(and(eq(users.username, owner), eq(repositories.name, name)))
-    .limit(1);
-
-  const row = result[0];
-  if (!row) {
-    return null;
-  }
-
-  if (!(await canAccessRepository(row, user))) {
-    return null;
-  }
-
-  return { repoId: row.id, ownerId: row.ownerId };
-}
 
 async function enrichProjectItem(item: any) {
   if (item.issueId) {
@@ -105,7 +82,7 @@ app.get("/api/repositories/:owner/:name/projects", async (c) => {
   const name = c.req.param("name");
   const currentUser = c.get("user");
 
-  const repoAccess = await getRepoAndCheckAccess(owner, name, currentUser?.id);
+  const repoAccess = await resolveRepositoryWithAccess(owner, name, currentUser);
   if (!repoAccess) {
     return c.json({ error: "Repository not found" }, 404);
   }
@@ -113,7 +90,7 @@ app.get("/api/repositories/:owner/:name/projects", async (c) => {
   const projectList = await db
     .select()
     .from(projects)
-    .where(eq(projects.repositoryId, repoAccess.repoId))
+    .where(eq(projects.repositoryId, repoAccess.id))
     .orderBy(projects.createdAt);
 
   return c.json({ projects: projectList });
@@ -125,12 +102,12 @@ app.post("/api/repositories/:owner/:name/projects", requireAuth, async (c) => {
   const user = c.get("user")!;
   const body = await c.req.json<{ name: string; description?: string }>();
 
-  const repoAccess = await getRepoAndCheckAccess(owner, name, user.id);
+  const repoAccess = await resolveRepositoryWithAccess(owner, name, user);
   if (!repoAccess) {
     return c.json({ error: "Repository not found" }, 404);
   }
 
-  if (user.id !== repoAccess.ownerId) {
+  if (!(await canManageRepository(repoAccess, user))) {
     return c.json({ error: "Only repo owner can create projects" }, 403);
   }
 
@@ -141,7 +118,7 @@ app.post("/api/repositories/:owner/:name/projects", requireAuth, async (c) => {
   const [inserted] = await db
     .insert(projects)
     .values({
-      repositoryId: repoAccess.repoId,
+      repositoryId: repoAccess.id,
       name: body.name,
       description: body.description,
     })

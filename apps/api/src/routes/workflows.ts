@@ -1,34 +1,14 @@
 import { Hono } from 'hono';
-import { db, users, repositories, workflows, workflowRuns, workflowJobs, workflowSteps } from '@sigmagit/db';
+import { db, workflows, workflowRuns, workflowJobs, workflowSteps } from '@sigmagit/db';
 import { eq, and, desc, asc, inArray } from 'drizzle-orm';
 import { authMiddleware, requireAuth, type AuthVariables } from '../middleware/auth';
 import { parseLimit, parsePage } from '../lib/validation';
-import { canAccessRepository } from '../lib/access';
+import { canManageRepository } from '../lib/access';
+import { resolveRepositoryWithAccess } from '../lib/repo-helpers';
 import { syncWorkflows } from '../workflows/sync';
 import { triggerWorkflows } from '../workflows/trigger';
 
 const app = new Hono<{ Variables: AuthVariables }>();
-
-
-// ─── Helper ────────────────────────────────────────────────────────────────────
-
-async function getRepoAccess(owner: string, name: string, user?: { id: string; role?: string } | null) {
-  const [row] = await db
-    .select({
-      id: repositories.id,
-      ownerId: repositories.ownerId,
-      visibility: repositories.visibility,
-      defaultBranch: repositories.defaultBranch,
-    })
-    .from(repositories)
-    .innerJoin(users, eq(users.id, repositories.ownerId))
-    .where(and(eq(users.username, owner), eq(repositories.name, name)))
-    .limit(1);
-
-  if (!row) return null;
-  if (!(await canAccessRepository(row, user))) return null;
-  return row;
-}
 
 // ─── Workflow sync ─────────────────────────────────────────────────────────────
 
@@ -37,9 +17,9 @@ app.post('/api/repositories/:owner/:repo/workflows/sync', requireAuth, async (c)
   const repo = c.req.param('repo');
   const user = c.get('user')!;
 
-  const repoRow = await getRepoAccess(owner, repo, user);
+  const repoRow = await resolveRepositoryWithAccess(owner, repo, user);
   if (!repoRow) return c.json({ error: 'Repository not found' }, 404);
-  if (user.id !== repoRow.ownerId) return c.json({ error: 'Forbidden' }, 403);
+  if (!(await canManageRepository(repoRow, user))) return c.json({ error: 'Forbidden' }, 403);
 
   await syncWorkflows(repoRow.id);
 
@@ -59,7 +39,7 @@ app.get('/api/repositories/:owner/:repo/workflows', async (c) => {
   const repo = c.req.param('repo');
   const user = c.get('user');
 
-  const repoRow = await getRepoAccess(owner, repo, user);
+  const repoRow = await resolveRepositoryWithAccess(owner, repo, user);
   if (!repoRow) return c.json({ error: 'Repository not found' }, 404);
 
   const wfs = await db
@@ -79,9 +59,9 @@ app.post('/api/repositories/:owner/:repo/workflows/:workflowId/dispatch', requir
   const workflowId = c.req.param('workflowId');
   const user = c.get('user')!;
 
-  const repoRow = await getRepoAccess(owner, repo, user);
+  const repoRow = await resolveRepositoryWithAccess(owner, repo, user);
   if (!repoRow) return c.json({ error: 'Repository not found' }, 404);
-  if (user.id !== repoRow.ownerId) return c.json({ error: 'Forbidden' }, 403);
+  if (!(await canManageRepository(repoRow, user))) return c.json({ error: 'Forbidden' }, 403);
 
   const body = await c.req.json().catch(() => ({})) as {
     ref?: string;
@@ -124,7 +104,7 @@ app.get('/api/repositories/:owner/:repo/runs', async (c) => {
   const repo = c.req.param('repo');
   const user = c.get('user');
 
-  const repoRow = await getRepoAccess(owner, repo, user);
+  const repoRow = await resolveRepositoryWithAccess(owner, repo, user);
   if (!repoRow) return c.json({ error: 'Repository not found' }, 404);
 
   const page = parsePage(c.req.query('page'), 1);
@@ -163,7 +143,7 @@ app.get('/api/repositories/:owner/:repo/runs/:runId', async (c) => {
   const runId = c.req.param('runId');
   const user = c.get('user');
 
-  const repoRow = await getRepoAccess(owner, repo, user);
+  const repoRow = await resolveRepositoryWithAccess(owner, repo, user);
   if (!repoRow) return c.json({ error: 'Repository not found' }, 404);
 
   const [run] = await db
@@ -208,7 +188,7 @@ app.get('/api/repositories/:owner/:repo/runs/:runId/jobs/:jobId/logs', async (c)
   const jobId = c.req.param('jobId');
   const user = c.get('user');
 
-  const repoRow = await getRepoAccess(owner, repo, user);
+  const repoRow = await resolveRepositoryWithAccess(owner, repo, user);
   if (!repoRow) return c.json({ error: 'Repository not found' }, 404);
 
   const [job] = await db
@@ -248,9 +228,9 @@ app.post('/api/repositories/:owner/:repo/runs/:runId/cancel', requireAuth, async
   const runId = c.req.param('runId');
   const user = c.get('user')!;
 
-  const repoRow = await getRepoAccess(owner, repo, user);
+  const repoRow = await resolveRepositoryWithAccess(owner, repo, user);
   if (!repoRow) return c.json({ error: 'Repository not found' }, 404);
-  if (user.id !== repoRow.ownerId) return c.json({ error: 'Forbidden' }, 403);
+  if (!(await canManageRepository(repoRow, user))) return c.json({ error: 'Forbidden' }, 403);
 
   const now = new Date();
 

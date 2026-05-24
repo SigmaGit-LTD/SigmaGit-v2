@@ -16,7 +16,7 @@ import { eq, sql, and, desc, or, inArray } from "drizzle-orm";
 import { requireAuth, type AuthVariables } from "../middleware/auth";
 import { parseLimit, parseOffset } from "../lib/validation";
 import { canAccessRepository } from "../lib/access";
-import { getStorageOwnerId } from "../lib/repo-helpers";
+import { resolveRepositoryWithAccess, getStorageOwnerId } from "../lib/repo-helpers";
 import { writeRateLimit } from "../middleware/rate-limit";
 import { createGitStore, getCommits, getTree, getCommitDiff, performMerge, squashMerge, rebaseMerge, repoCache } from "../git";
 import { deliverWebhookEvent } from "./repo-webhooks";
@@ -25,31 +25,6 @@ import { triggerWorkflows } from "../workflows/trigger";
 const app = new Hono<{ Variables: AuthVariables }>();
 
 const VALID_EMOJIS = ["+1", "-1", "laugh", "hooray", "confused", "heart", "rocket", "eyes"];
-
-async function getRepoAndCheckAccess(owner: string, name: string, user?: { id: string; role?: string } | null) {
-  const result = await db
-    .select({
-      id: repositories.id,
-      ownerId: repositories.ownerId,
-      visibility: repositories.visibility,
-      defaultBranch: repositories.defaultBranch,
-    })
-    .from(repositories)
-    .innerJoin(users, eq(users.id, repositories.ownerId))
-    .where(and(eq(users.username, owner), eq(repositories.name, name)))
-    .limit(1);
-
-  const row = result[0];
-  if (!row) {
-    return null;
-  }
-
-  if (!(await canAccessRepository(row, user))) {
-    return null;
-  }
-
-  return { repoId: row.id, ownerId: row.ownerId, defaultBranch: row.defaultBranch };
-}
 
 async function getPRLabels(prId: string) {
   return db
@@ -531,7 +506,7 @@ app.get("/api/repositories/:owner/:name/pulls", async (c) => {
   const limit = parseLimit(c.req.query("limit"), 30);
   const offset = parseOffset(c.req.query("offset"), 0);
 
-  const repoAccess = await getRepoAndCheckAccess(owner, name, currentUser?.id);
+  const repoAccess = await resolveRepositoryWithAccess(owner, name, currentUser);
   if (!repoAccess) {
     return c.json({ error: "Repository not found" }, 404);
   }
@@ -547,7 +522,7 @@ app.get("/api/repositories/:owner/:name/pulls", async (c) => {
     stateCondition = eq(pullRequests.state, "open");
   }
 
-  const conditions = [eq(pullRequests.repositoryId, repoAccess.repoId)];
+  const conditions = [eq(pullRequests.repositoryId, repoAccess.id)];
   if (stateCondition) {
     conditions.push(stateCondition);
   }
@@ -585,7 +560,7 @@ app.post("/api/repositories/:owner/:name/pulls", requireAuth, writeRateLimit, as
     isDraft?: boolean;
   }>();
 
-  const repoAccess = await getRepoAndCheckAccess(owner, name, user.id);
+  const repoAccess = await resolveRepositoryWithAccess(owner, name, user);
   if (!repoAccess) {
     return c.json({ error: "Repository not found" }, 404);
   }
@@ -600,31 +575,31 @@ app.post("/api/repositories/:owner/:name/pulls", requireAuth, writeRateLimit, as
 
   const baseBranch = body.baseBranch || repoAccess.defaultBranch;
 
-  let headRepoId = repoAccess.repoId;
-  let headRepoOwnerId = repoAccess.ownerId;
+  let headRepoId = repoAccess.id;
+  let headStorageOwnerId = repoAccess.storageOwnerId;
 
   if (body.headRepoOwner && body.headRepoName) {
-    const headRepoAccess = await getRepoAndCheckAccess(body.headRepoOwner, body.headRepoName, user.id);
+    const headRepoAccess = await resolveRepositoryWithAccess(body.headRepoOwner, body.headRepoName, user);
     if (!headRepoAccess) {
       return c.json({ error: "Head repository not found" }, 404);
     }
-    headRepoId = headRepoAccess.repoId;
-    headRepoOwnerId = headRepoAccess.ownerId;
+    headRepoId = headRepoAccess.id;
+    headStorageOwnerId = headRepoAccess.storageOwnerId;
   }
 
   const headRepo = await db.query.repositories.findFirst({
     where: eq(repositories.id, headRepoId),
   });
   const baseRepo = await db.query.repositories.findFirst({
-    where: eq(repositories.id, repoAccess.repoId),
+    where: eq(repositories.id, repoAccess.id),
   });
 
   if (!headRepo || !baseRepo) {
     return c.json({ error: "Repository not found" }, 404);
   }
 
-  const headStore = createGitStore(headRepoOwnerId, headRepo.name);
-  const baseStore = createGitStore(repoAccess.ownerId, baseRepo.name);
+  const headStore = createGitStore(headStorageOwnerId, headRepo.name);
+  const baseStore = createGitStore(repoAccess.storageOwnerId, baseRepo.name);
 
   const headCommits = await getCommits(headStore.fs, headStore.dir, body.headBranch, 1, 0);
   const baseCommits = await getCommits(baseStore.fs, baseStore.dir, baseBranch, 1, 0);
@@ -643,12 +618,12 @@ app.post("/api/repositories/:owner/:name/pulls", requireAuth, writeRateLimit, as
   const [maxNumber] = await db
     .select({ max: sql<number>`COALESCE(MAX(number), 0)` })
     .from(pullRequests)
-    .where(eq(pullRequests.repositoryId, repoAccess.repoId));
+    .where(eq(pullRequests.repositoryId, repoAccess.id));
 
   const [inserted] = await db
     .insert(pullRequests)
     .values({
-      repositoryId: repoAccess.repoId,
+      repositoryId: repoAccess.id,
       authorId: user.id,
       title: body.title,
       body: body.body,
@@ -656,7 +631,7 @@ app.post("/api/repositories/:owner/:name/pulls", requireAuth, writeRateLimit, as
       headRepoId,
       headBranch: body.headBranch,
       headOid,
-      baseRepoId: repoAccess.repoId,
+      baseRepoId: repoAccess.id,
       baseBranch,
       baseOid,
       isDraft: body.isDraft ?? false,
@@ -685,7 +660,7 @@ app.post("/api/repositories/:owner/:name/pulls", requireAuth, writeRateLimit, as
 
   // Trigger pull_request workflows — fire-and-forget
   triggerWorkflows({
-    repoId: repoAccess.repoId,
+    repoId: repoAccess.id,
     branch: body.headBranch,
     commitSha: headOid,
     eventName: 'pull_request',
@@ -701,7 +676,7 @@ app.get("/api/repositories/:owner/:name/pulls/count", async (c) => {
   const name = c.req.param("name");
   const currentUser = c.get("user");
 
-  const repoAccess = await getRepoAndCheckAccess(owner, name, currentUser?.id);
+  const repoAccess = await resolveRepositoryWithAccess(owner, name, currentUser);
   if (!repoAccess) {
     return c.json({ error: "Repository not found" }, 404);
   }
@@ -709,19 +684,19 @@ app.get("/api/repositories/:owner/:name/pulls/count", async (c) => {
   const [openCount] = await db
     .select({ count: sql<number>`COUNT(*)` })
     .from(pullRequests)
-    .where(and(eq(pullRequests.repositoryId, repoAccess.repoId), eq(pullRequests.state, "open")));
+    .where(and(eq(pullRequests.repositoryId, repoAccess.id), eq(pullRequests.state, "open")));
 
   const [closedCount] = await db
     .select({ count: sql<number>`COUNT(*)` })
     .from(pullRequests)
     .where(
-      and(eq(pullRequests.repositoryId, repoAccess.repoId), eq(pullRequests.state, "closed"), eq(pullRequests.merged, false))
+      and(eq(pullRequests.repositoryId, repoAccess.id), eq(pullRequests.state, "closed"), eq(pullRequests.merged, false))
     );
 
   const [mergedCount] = await db
     .select({ count: sql<number>`COUNT(*)` })
     .from(pullRequests)
-    .where(and(eq(pullRequests.repositoryId, repoAccess.repoId), eq(pullRequests.merged, true)));
+    .where(and(eq(pullRequests.repositoryId, repoAccess.id), eq(pullRequests.merged, true)));
 
   return c.json({
     open: openCount?.count || 0,
@@ -736,13 +711,13 @@ app.get("/api/repositories/:owner/:name/pulls/:number", async (c) => {
   const number = parseInt(c.req.param("number"), 10);
   const currentUser = c.get("user");
 
-  const repoAccess = await getRepoAndCheckAccess(owner, name, currentUser?.id);
+  const repoAccess = await resolveRepositoryWithAccess(owner, name, currentUser);
   if (!repoAccess) {
     return c.json({ error: "Repository not found" }, 404);
   }
 
   const pr = await db.query.pullRequests.findFirst({
-    where: and(eq(pullRequests.repositoryId, repoAccess.repoId), eq(pullRequests.number, number)),
+    where: and(eq(pullRequests.repositoryId, repoAccess.id), eq(pullRequests.number, number)),
   });
 
   if (!pr) {

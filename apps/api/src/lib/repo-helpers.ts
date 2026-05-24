@@ -1,6 +1,7 @@
 import { db, repositories, organizations, users } from '@sigmagit/db';
 import { eq, and, isNull } from 'drizzle-orm';
 import { createGitStore, type GitStore } from '../git';
+import { canAccessRepository, type AccessUser } from './access';
 
 export function getStorageOwnerId(repo: { ownerId: string; organizationId?: string | null }): string {
   return repo.organizationId ?? repo.ownerId;
@@ -105,4 +106,16 @@ export async function resolveRepositoryBySlug(
 
 export function createRepoGitStore(repo: ResolvedRepo): GitStore {
   return createGitStore(repo.storageOwnerId, repo.name);
+}
+
+export async function resolveRepositoryWithAccess(
+  ownerSlug: string,
+  repoName: string,
+  user?: AccessUser,
+  writeRequired = false
+): Promise<ResolvedRepo | null> {
+  const repo = await resolveRepositoryBySlug(ownerSlug, repoName);
+  if (!repo) return null;
+  if (!(await canAccessRepository(repo, user, writeRequired))) return null;
+  return repo;
 }

@@ -13,37 +13,14 @@ import {
 import { eq, sql, and, desc, inArray } from "drizzle-orm";
 import { authMiddleware, requireAuth, type AuthVariables } from "../middleware/auth";
 import { parseLimit, parseOffset } from "../lib/validation";
-import { canAccessRepository } from "../lib/access";
+import { canManageRepository } from "../lib/access";
+import { resolveRepositoryWithAccess } from "../lib/repo-helpers";
 import { writeRateLimit } from "../middleware/rate-limit";
 
 const app = new Hono<{ Variables: AuthVariables }>();
 
 
 const VALID_EMOJIS = ["+1", "-1", "laugh", "hooray", "confused", "heart", "rocket", "eyes"];
-
-async function getRepoAndCheckAccess(owner: string, name: string, user?: { id: string; role?: string } | null) {
-  const result = await db
-    .select({
-      id: repositories.id,
-      ownerId: repositories.ownerId,
-      visibility: repositories.visibility,
-    })
-    .from(repositories)
-    .innerJoin(users, eq(users.id, repositories.ownerId))
-    .where(and(eq(users.username, owner), eq(repositories.name, name)))
-    .limit(1);
-
-  const row = result[0];
-  if (!row) {
-    return null;
-  }
-
-  if (!(await canAccessRepository(row, user))) {
-    return null;
-  }
-
-  return { repoId: row.id, ownerId: row.ownerId };
-}
 
 async function getIssueLabels(issueId: string) {
   return db
@@ -169,7 +146,7 @@ app.get("/api/repositories/:owner/:name/issues", async (c) => {
   const limit = parseLimit(c.req.query("limit"), 30);
   const offset = parseOffset(c.req.query("offset"), 0);
 
-  const repoAccess = await getRepoAndCheckAccess(owner, name, currentUser?.id);
+  const repoAccess = await resolveRepositoryWithAccess(owner, name, currentUser);
   if (!repoAccess) {
     return c.json({ error: "Repository not found" }, 404);
   }
@@ -189,7 +166,7 @@ app.get("/api/repositories/:owner/:name/issues", async (c) => {
       closedById: issues.closedById,
     })
     .from(issues)
-    .where(and(eq(issues.repositoryId, repoAccess.repoId), eq(issues.state, state)))
+    .where(and(eq(issues.repositoryId, repoAccess.id), eq(issues.state, state)))
     .orderBy(desc(issues.createdAt))
     .limit(limit + 1)
     .offset(offset);
@@ -335,7 +312,7 @@ app.post("/api/repositories/:owner/:name/issues", requireAuth, writeRateLimit, a
     assignees?: string[];
   }>();
 
-  const repoAccess = await getRepoAndCheckAccess(owner, name, user.id);
+  const repoAccess = await resolveRepositoryWithAccess(owner, name, user);
   if (!repoAccess) {
     return c.json({ error: "Repository not found" }, 404);
   }
@@ -347,12 +324,12 @@ app.post("/api/repositories/:owner/:name/issues", requireAuth, writeRateLimit, a
   const [maxNumber] = await db
     .select({ max: sql<number>`COALESCE(MAX(number), 0)` })
     .from(issues)
-    .where(eq(issues.repositoryId, repoAccess.repoId));
+    .where(eq(issues.repositoryId, repoAccess.id));
 
   const [inserted] = await db
     .insert(issues)
     .values({
-      repositoryId: repoAccess.repoId,
+      repositoryId: repoAccess.id,
       authorId: user.id,
       title: body.title,
       body: body.body,
@@ -399,7 +376,7 @@ app.get("/api/repositories/:owner/:name/issues/count", async (c) => {
   const name = c.req.param("name");
   const currentUser = c.get("user");
 
-  const repoAccess = await getRepoAndCheckAccess(owner, name, currentUser?.id);
+  const repoAccess = await resolveRepositoryWithAccess(owner, name, currentUser);
   if (!repoAccess) {
     return c.json({ error: "Repository not found" }, 404);
   }
@@ -407,12 +384,12 @@ app.get("/api/repositories/:owner/:name/issues/count", async (c) => {
   const [openCount] = await db
     .select({ count: sql<number>`COUNT(*)` })
     .from(issues)
-    .where(and(eq(issues.repositoryId, repoAccess.repoId), eq(issues.state, "open")));
+    .where(and(eq(issues.repositoryId, repoAccess.id), eq(issues.state, "open")));
 
   const [closedCount] = await db
     .select({ count: sql<number>`COUNT(*)` })
     .from(issues)
-    .where(and(eq(issues.repositoryId, repoAccess.repoId), eq(issues.state, "closed")));
+    .where(and(eq(issues.repositoryId, repoAccess.id), eq(issues.state, "closed")));
 
   return c.json({ open: openCount?.count || 0, closed: closedCount?.count || 0 });
 });
@@ -423,13 +400,13 @@ app.get("/api/repositories/:owner/:name/issues/:number", async (c) => {
   const number = parseInt(c.req.param("number"), 10);
   const currentUser = c.get("user");
 
-  const repoAccess = await getRepoAndCheckAccess(owner, name, currentUser?.id);
+  const repoAccess = await resolveRepositoryWithAccess(owner, name, currentUser);
   if (!repoAccess) {
     return c.json({ error: "Repository not found" }, 404);
   }
 
   const issue = await db.query.issues.findFirst({
-    where: and(eq(issues.repositoryId, repoAccess.repoId), eq(issues.number, number)),
+    where: and(eq(issues.repositoryId, repoAccess.id), eq(issues.number, number)),
   });
 
   if (!issue) {
@@ -556,7 +533,7 @@ app.get("/api/repositories/:owner/:name/labels", async (c) => {
   const name = c.req.param("name");
   const currentUser = c.get("user");
 
-  const repoAccess = await getRepoAndCheckAccess(owner, name, currentUser?.id);
+  const repoAccess = await resolveRepositoryWithAccess(owner, name, currentUser);
   if (!repoAccess) {
     return c.json({ error: "Repository not found" }, 404);
   }
@@ -569,7 +546,7 @@ app.get("/api/repositories/:owner/:name/labels", async (c) => {
       color: labels.color,
     })
     .from(labels)
-    .where(eq(labels.repositoryId, repoAccess.repoId))
+    .where(eq(labels.repositoryId, repoAccess.id))
     .orderBy(labels.name);
 
   return c.json({ labels: labelsData });
@@ -585,12 +562,12 @@ app.post("/api/repositories/:owner/:name/labels", requireAuth, async (c) => {
     color: string;
   }>();
 
-  const repoAccess = await getRepoAndCheckAccess(owner, name, user.id);
+  const repoAccess = await resolveRepositoryWithAccess(owner, name, user);
   if (!repoAccess) {
     return c.json({ error: "Repository not found" }, 404);
   }
 
-  if (user.id !== repoAccess.ownerId) {
+  if (!(await canManageRepository(repoAccess, user))) {
     return c.json({ error: "Only repo owner can create labels" }, 403);
   }
 
@@ -601,7 +578,7 @@ app.post("/api/repositories/:owner/:name/labels", requireAuth, async (c) => {
   const [label] = await db
     .insert(labels)
     .values({
-      repositoryId: repoAccess.repoId,
+      repositoryId: repoAccess.id,
       name: body.name,
       description: body.description,
       color: body.color,

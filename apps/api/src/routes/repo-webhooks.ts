@@ -1,24 +1,15 @@
 import { Hono } from "hono";
-import { db, users, repositories, repositoryWebhooks } from "@sigmagit/db";
+import { db, repositoryWebhooks } from "@sigmagit/db";
 import { eq, and } from "drizzle-orm";
 import { authMiddleware, requireAuth, type AuthVariables } from "../middleware/auth";
 import { createHmac } from "crypto";
 import { config } from "../config";
+import { canManageRepository } from "../lib/access";
+import { resolveRepositoryWithAccess } from "../lib/repo-helpers";
 
 export type WebhookEvent = "push" | "pull_request" | "issues" | "tag" | "branch";
 
 const app = new Hono<{ Variables: AuthVariables }>();
-
-
-async function getRepoByOwnerName(owner: string, name: string) {
-  const result = await db
-    .select({ id: repositories.id, ownerId: repositories.ownerId })
-    .from(repositories)
-    .innerJoin(users, eq(users.id, repositories.ownerId))
-    .where(and(eq(users.username, owner), eq(repositories.name, name)))
-    .limit(1);
-  return result[0] ?? null;
-}
 
 // ─── Utility: deliver a webhook payload to all matching hooks ────────────────
 
@@ -68,9 +59,11 @@ app.get("/api/repositories/:owner/:name/webhooks", requireAuth, async (c) => {
   const name = c.req.param("name");
   const currentUser = c.get("user")!;
 
-  const repo = await getRepoByOwnerName(owner, name);
+  const repo = await resolveRepositoryWithAccess(owner, name, currentUser);
   if (!repo) return c.json({ error: "Repository not found" }, 404);
-  if (currentUser.id !== repo.ownerId) return c.json({ error: "Not authorized" }, 403);
+  if (!(await canManageRepository(repo, currentUser))) {
+    return c.json({ error: "Not authorized" }, 403);
+  }
 
   const hooks = await db.query.repositoryWebhooks.findMany({
     where: eq(repositoryWebhooks.repositoryId, repo.id),
@@ -105,9 +98,11 @@ app.post("/api/repositories/:owner/:name/webhooks", requireAuth, async (c) => {
     return c.json({ error: "Invalid URL" }, 400);
   }
 
-  const repo = await getRepoByOwnerName(owner, name);
+  const repo = await resolveRepositoryWithAccess(owner, name, currentUser);
   if (!repo) return c.json({ error: "Repository not found" }, 404);
-  if (currentUser.id !== repo.ownerId) return c.json({ error: "Not authorized" }, 403);
+  if (!(await canManageRepository(repo, currentUser))) {
+    return c.json({ error: "Not authorized" }, 403);
+  }
 
   const [hook] = await db
     .insert(repositoryWebhooks)
@@ -140,9 +135,11 @@ app.patch("/api/repositories/:owner/:name/webhooks/:hookId", requireAuth, async 
     contentType?: "json" | "form";
   }>();
 
-  const repo = await getRepoByOwnerName(owner, name);
+  const repo = await resolveRepositoryWithAccess(owner, name, currentUser);
   if (!repo) return c.json({ error: "Repository not found" }, 404);
-  if (currentUser.id !== repo.ownerId) return c.json({ error: "Not authorized" }, 403);
+  if (!(await canManageRepository(repo, currentUser))) {
+    return c.json({ error: "Not authorized" }, 403);
+  }
 
   const existing = await db.query.repositoryWebhooks.findFirst({
     where: and(eq(repositoryWebhooks.id, hookId), eq(repositoryWebhooks.repositoryId, repo.id)),
@@ -172,9 +169,11 @@ app.delete("/api/repositories/:owner/:name/webhooks/:hookId", requireAuth, async
   const hookId = c.req.param("hookId");
   const currentUser = c.get("user")!;
 
-  const repo = await getRepoByOwnerName(owner, name);
+  const repo = await resolveRepositoryWithAccess(owner, name, currentUser);
   if (!repo) return c.json({ error: "Repository not found" }, 404);
-  if (currentUser.id !== repo.ownerId) return c.json({ error: "Not authorized" }, 403);
+  if (!(await canManageRepository(repo, currentUser))) {
+    return c.json({ error: "Not authorized" }, 403);
+  }
 
   await db
     .delete(repositoryWebhooks)

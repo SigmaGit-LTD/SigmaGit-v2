@@ -1,12 +1,24 @@
 import { randomUUID } from "crypto";
 import { Hono } from "hono";
-import { db, releases, releaseAssets, releaseComments, releaseReactions, repositories, users } from "@sigmagit/db";
-import { eq, and, sql, desc, count } from "drizzle-orm";
+import { db, releases, releaseAssets } from "@sigmagit/db";
+import { eq, and, desc } from "drizzle-orm";
 import { authMiddleware, requireAuth, type AuthVariables } from "../middleware/auth";
 import { putObject, getObjectStream, deleteObject } from "../storage";
+import { canAccessRepository } from "../lib/access";
+import { resolveRepositoryWithAccess, type ResolvedRepo } from "../lib/repo-helpers";
 
 const app = new Hono<{ Variables: AuthVariables }>();
 
+type AuthUser = NonNullable<AuthVariables["user"]>;
+
+async function canModifyRelease(
+  release: { authorId: string },
+  repo: ResolvedRepo,
+  user: AuthUser
+): Promise<boolean> {
+  if (release.authorId === user.id) return true;
+  return canAccessRepository(repo, user, true);
+}
 
 app.get("/api/repositories/:owner/:name/releases", async (c) => {
   const owner = c.req.param("owner");
@@ -14,28 +26,20 @@ app.get("/api/repositories/:owner/:name/releases", async (c) => {
   const user = c.get("user");
   const includeDrafts = c.req.query("draft") === "true";
 
-  const [repo] = await db
-    .select()
-    .from(repositories)
-    .where(
-      and(
-        eq(repositories.name, name),
-        eq(users.username, owner)
-      )
-    )
-    .innerJoin(users, eq(repositories.ownerId, users.id));
-
+  const repo = await resolveRepositoryWithAccess(owner, name, user);
   if (!repo) {
     return c.json({ error: "Repository not found" }, 404);
   }
+
+  const canSeeDrafts = includeDrafts && (await canAccessRepository(repo, user, true));
 
   const releasesList = await db
     .select()
     .from(releases)
     .where(
       and(
-        eq(releases.repositoryId, repo.repositories.id),
-        includeDrafts ? undefined : eq(releases.isDraft, false)
+        eq(releases.repositoryId, repo.id),
+        canSeeDrafts ? undefined : eq(releases.isDraft, false)
       )
     )
     .orderBy(desc(releases.createdAt));
@@ -48,17 +52,7 @@ app.get("/api/repositories/:owner/:name/releases/latest", async (c) => {
   const name = c.req.param("name");
   const user = c.get("user");
 
-  const [repo] = await db
-    .select()
-    .from(repositories)
-    .where(
-      and(
-        eq(repositories.name, name),
-        eq(users.username, owner)
-      )
-    )
-    .innerJoin(users, eq(repositories.ownerId, users.id));
-
+  const repo = await resolveRepositoryWithAccess(owner, name, user);
   if (!repo) {
     return c.json({ error: "Repository not found" }, 404);
   }
@@ -68,7 +62,7 @@ app.get("/api/repositories/:owner/:name/releases/latest", async (c) => {
     .from(releases)
     .where(
       and(
-        eq(releases.repositoryId, repo.repositories.id),
+        eq(releases.repositoryId, repo.id),
         eq(releases.isDraft, false),
         eq(releases.isPrerelease, false)
       )
@@ -80,7 +74,7 @@ app.get("/api/repositories/:owner/:name/releases/latest", async (c) => {
     return c.json({ error: "No release found" }, 404);
   }
 
-  const [assets] = await db
+  const assets = await db
     .select()
     .from(releaseAssets)
     .where(eq(releaseAssets.releaseId, release.id));
@@ -94,17 +88,7 @@ app.get("/api/repositories/:owner/:name/releases/tag/:tag", async (c) => {
   const tag = c.req.param("tag");
   const user = c.get("user");
 
-  const [repo] = await db
-    .select()
-    .from(repositories)
-    .where(
-      and(
-        eq(repositories.name, name),
-        eq(users.username, owner)
-      )
-    )
-    .innerJoin(users, eq(repositories.ownerId, users.id));
-
+  const repo = await resolveRepositoryWithAccess(owner, name, user);
   if (!repo) {
     return c.json({ error: "Repository not found" }, 404);
   }
@@ -112,18 +96,17 @@ app.get("/api/repositories/:owner/:name/releases/tag/:tag", async (c) => {
   const [release] = await db
     .select()
     .from(releases)
-    .where(
-      and(
-        eq(releases.repositoryId, repo.repositories.id),
-        eq(releases.tagName, tag)
-      )
-    );
+    .where(and(eq(releases.repositoryId, repo.id), eq(releases.tagName, tag)));
 
   if (!release) {
     return c.json({ error: "Release not found" }, 404);
   }
 
-  const [assets] = await db
+  if (release.isDraft && !(await canAccessRepository(repo, user, true))) {
+    return c.json({ error: "Release not found" }, 404);
+  }
+
+  const assets = await db
     .select()
     .from(releaseAssets)
     .where(eq(releaseAssets.releaseId, release.id));
@@ -138,34 +121,15 @@ app.post("/api/repositories/:owner/:name/releases", requireAuth, async (c) => {
   const body = await c.req.json();
   const { tagName, name: releaseName, body: releaseBody, isDraft, isPrerelease, targetCommitish } = body;
 
-  const [repo] = await db
-    .select()
-    .from(repositories)
-    .where(
-      and(
-        eq(repositories.name, repoName),
-        eq(users.username, owner)
-      )
-    )
-    .innerJoin(users, eq(repositories.ownerId, users.id));
-
+  const repo = await resolveRepositoryWithAccess(owner, repoName, user, true);
   if (!repo) {
     return c.json({ error: "Repository not found" }, 404);
-  }
-
-  if (repo.repositories.ownerId !== user.id) {
-    return c.json({ error: "Forbidden" }, 403);
   }
 
   const [existingRelease] = await db
     .select()
     .from(releases)
-    .where(
-      and(
-        eq(releases.repositoryId, repo.repositories.id),
-        eq(releases.tagName, tagName)
-      )
-    );
+    .where(and(eq(releases.repositoryId, repo.id), eq(releases.tagName, tagName)));
 
   if (existingRelease) {
     return c.json({ error: "Release with this tag already exists" }, 400);
@@ -174,14 +138,14 @@ app.post("/api/repositories/:owner/:name/releases", requireAuth, async (c) => {
   const [release] = await db
     .insert(releases)
     .values({
-      repositoryId: repo.repositories.id,
+      repositoryId: repo.id,
       authorId: user.id,
       tagName,
       name: releaseName,
       body: releaseBody,
       isDraft: isDraft || false,
       isPrerelease: isPrerelease || false,
-      targetCommitish: targetCommitish || "main",
+      targetCommitish: targetCommitish || repo.defaultBranch,
       publishedAt: isDraft ? null : new Date(),
       createdAt: new Date(),
       updatedAt: new Date(),
@@ -198,17 +162,7 @@ app.patch("/api/repositories/:owner/:name/releases/:id", requireAuth, async (c) 
   const repoName = c.req.param("name");
   const body = await c.req.json();
 
-  const [repo] = await db
-    .select()
-    .from(repositories)
-    .where(
-      and(
-        eq(repositories.name, repoName),
-        eq(users.username, owner)
-      )
-    )
-    .innerJoin(users, eq(repositories.ownerId, users.id));
-
+  const repo = await resolveRepositoryWithAccess(owner, repoName, user);
   if (!repo) {
     return c.json({ error: "Repository not found" }, 404);
   }
@@ -216,18 +170,13 @@ app.patch("/api/repositories/:owner/:name/releases/:id", requireAuth, async (c) 
   const [release] = await db
     .select()
     .from(releases)
-    .where(
-      and(
-        eq(releases.id, id),
-        eq(releases.repositoryId, repo.repositories.id)
-      )
-    );
+    .where(and(eq(releases.id, id), eq(releases.repositoryId, repo.id)));
 
   if (!release) {
     return c.json({ error: "Release not found" }, 404);
   }
 
-  if (release.authorId !== user.id) {
+  if (!(await canModifyRelease(release, repo, user))) {
     return c.json({ error: "Forbidden" }, 403);
   }
 
@@ -252,17 +201,7 @@ app.delete("/api/repositories/:owner/:name/releases/:id", requireAuth, async (c)
   const owner = c.req.param("owner");
   const repoName = c.req.param("name");
 
-  const [repo] = await db
-    .select()
-    .from(repositories)
-    .where(
-      and(
-        eq(repositories.name, repoName),
-        eq(users.username, owner)
-      )
-    )
-    .innerJoin(users, eq(repositories.ownerId, users.id));
-
+  const repo = await resolveRepositoryWithAccess(owner, repoName, user);
   if (!repo) {
     return c.json({ error: "Repository not found" }, 404);
   }
@@ -270,18 +209,13 @@ app.delete("/api/repositories/:owner/:name/releases/:id", requireAuth, async (c)
   const [release] = await db
     .select()
     .from(releases)
-    .where(
-      and(
-        eq(releases.id, id),
-        eq(releases.repositoryId, repo.repositories.id)
-      )
-    );
+    .where(and(eq(releases.id, id), eq(releases.repositoryId, repo.id)));
 
   if (!release) {
     return c.json({ error: "Release not found" }, 404);
   }
 
-  if (release.authorId !== user.id) {
+  if (!(await canModifyRelease(release, repo, user))) {
     return c.json({ error: "Forbidden" }, 403);
   }
 
@@ -296,17 +230,7 @@ app.post("/api/repositories/:owner/:name/releases/:id/publish", requireAuth, asy
   const owner = c.req.param("owner");
   const repoName = c.req.param("name");
 
-  const [repo] = await db
-    .select()
-    .from(repositories)
-    .where(
-      and(
-        eq(repositories.name, repoName),
-        eq(users.username, owner)
-      )
-    )
-    .innerJoin(users, eq(repositories.ownerId, users.id));
-
+  const repo = await resolveRepositoryWithAccess(owner, repoName, user);
   if (!repo) {
     return c.json({ error: "Repository not found" }, 404);
   }
@@ -314,18 +238,13 @@ app.post("/api/repositories/:owner/:name/releases/:id/publish", requireAuth, asy
   const [release] = await db
     .select()
     .from(releases)
-    .where(
-      and(
-        eq(releases.id, id),
-        eq(releases.repositoryId, repo.repositories.id)
-      )
-    );
+    .where(and(eq(releases.id, id), eq(releases.repositoryId, repo.id)));
 
   if (!release) {
     return c.json({ error: "Release not found" }, 404);
   }
 
-  if (release.authorId !== user.id) {
+  if (!(await canModifyRelease(release, repo, user))) {
     return c.json({ error: "Forbidden" }, 403);
   }
 
@@ -344,17 +263,7 @@ app.post("/api/repositories/:owner/:name/releases/:id/assets", requireAuth, asyn
   const owner = c.req.param("owner");
   const repoName = c.req.param("name");
 
-  const [repo] = await db
-    .select()
-    .from(repositories)
-    .where(
-      and(
-        eq(repositories.name, repoName),
-        eq(users.username, owner)
-      )
-    )
-    .innerJoin(users, eq(repositories.ownerId, users.id));
-
+  const repo = await resolveRepositoryWithAccess(owner, repoName, user);
   if (!repo) {
     return c.json({ error: "Repository not found" }, 404);
   }
@@ -362,18 +271,13 @@ app.post("/api/repositories/:owner/:name/releases/:id/assets", requireAuth, asyn
   const [release] = await db
     .select()
     .from(releases)
-    .where(
-      and(
-        eq(releases.id, id),
-        eq(releases.repositoryId, repo.repositories.id)
-      )
-    );
+    .where(and(eq(releases.id, id), eq(releases.repositoryId, repo.id)));
 
   if (!release) {
     return c.json({ error: "Release not found" }, 404);
   }
 
-  if (release.authorId !== user.id) {
+  if (!(await canModifyRelease(release, repo, user))) {
     return c.json({ error: "Forbidden" }, 403);
   }
 
@@ -414,7 +318,28 @@ app.post("/api/repositories/:owner/:name/releases/:id/assets", requireAuth, asyn
 });
 
 app.get("/api/repositories/:owner/:name/releases/:id/assets", async (c) => {
+  const owner = c.req.param("owner");
+  const repoName = c.req.param("name");
   const id = c.req.param("id");
+  const user = c.get("user");
+
+  const repo = await resolveRepositoryWithAccess(owner, repoName, user);
+  if (!repo) {
+    return c.json({ error: "Repository not found" }, 404);
+  }
+
+  const [release] = await db
+    .select()
+    .from(releases)
+    .where(and(eq(releases.id, id), eq(releases.repositoryId, repo.id)));
+
+  if (!release) {
+    return c.json({ error: "Release not found" }, 404);
+  }
+
+  if (release.isDraft && !(await canAccessRepository(repo, user, true))) {
+    return c.json({ error: "Release not found" }, 404);
+  }
 
   const assets = await db
     .select()
@@ -429,18 +354,9 @@ app.get("/api/repositories/:owner/:name/releases/:id/assets/:assetId", async (c)
   const assetId = c.req.param("assetId");
   const owner = c.req.param("owner");
   const repoName = c.req.param("name");
+  const user = c.get("user");
 
-  const [repo] = await db
-    .select()
-    .from(repositories)
-    .where(
-      and(
-        eq(repositories.name, repoName),
-        eq(users.username, owner)
-      )
-    )
-    .innerJoin(users, eq(repositories.ownerId, users.id));
-
+  const repo = await resolveRepositoryWithAccess(owner, repoName, user);
   if (!repo) {
     return c.json({ error: "Repository not found" }, 404);
   }
@@ -448,26 +364,20 @@ app.get("/api/repositories/:owner/:name/releases/:id/assets/:assetId", async (c)
   const [release] = await db
     .select()
     .from(releases)
-    .where(
-      and(
-        eq(releases.id, id),
-        eq(releases.repositoryId, repo.repositories.id)
-      )
-    );
+    .where(and(eq(releases.id, id), eq(releases.repositoryId, repo.id)));
 
   if (!release) {
+    return c.json({ error: "Release not found" }, 404);
+  }
+
+  if (release.isDraft && !(await canAccessRepository(repo, user, true))) {
     return c.json({ error: "Release not found" }, 404);
   }
 
   const [asset] = await db
     .select()
     .from(releaseAssets)
-    .where(
-      and(
-        eq(releaseAssets.id, assetId),
-        eq(releaseAssets.releaseId, release.id)
-      )
-    );
+    .where(and(eq(releaseAssets.id, assetId), eq(releaseAssets.releaseId, release.id)));
 
   if (!asset) {
     return c.json({ error: "Asset not found" }, 404);
@@ -494,17 +404,7 @@ app.delete("/api/repositories/:owner/:name/releases/:id/assets/:assetId", requir
   const owner = c.req.param("owner");
   const repoName = c.req.param("name");
 
-  const [repo] = await db
-    .select()
-    .from(repositories)
-    .where(
-      and(
-        eq(repositories.name, repoName),
-        eq(users.username, owner)
-      )
-    )
-    .innerJoin(users, eq(repositories.ownerId, users.id));
-
+  const repo = await resolveRepositoryWithAccess(owner, repoName, user);
   if (!repo) {
     return c.json({ error: "Repository not found" }, 404);
   }
@@ -512,18 +412,13 @@ app.delete("/api/repositories/:owner/:name/releases/:id/assets/:assetId", requir
   const [release] = await db
     .select()
     .from(releases)
-    .where(
-      and(
-        eq(releases.id, id),
-        eq(releases.repositoryId, repo.repositories.id)
-      )
-    );
+    .where(and(eq(releases.id, id), eq(releases.repositoryId, repo.id)));
 
   if (!release) {
     return c.json({ error: "Release not found" }, 404);
   }
 
-  if (release.authorId !== user.id) {
+  if (!(await canModifyRelease(release, repo, user))) {
     return c.json({ error: "Forbidden" }, 403);
   }
 

@@ -1,20 +1,11 @@
 import { Hono } from "hono";
-import { db, users, repositories, branchProtectionRules } from "@sigmagit/db";
+import { db, branchProtectionRules } from "@sigmagit/db";
 import { eq, and } from "drizzle-orm";
 import { authMiddleware, requireAuth, type AuthVariables } from "../middleware/auth";
+import { canManageRepository } from "../lib/access";
+import { resolveRepositoryWithAccess } from "../lib/repo-helpers";
 
 const app = new Hono<{ Variables: AuthVariables }>();
-
-
-async function getRepoByOwnerName(owner: string, name: string) {
-  const result = await db
-    .select({ id: repositories.id, ownerId: repositories.ownerId, visibility: repositories.visibility })
-    .from(repositories)
-    .innerJoin(users, eq(users.id, repositories.ownerId))
-    .where(and(eq(users.username, owner), eq(repositories.name, name)))
-    .limit(1);
-  return result[0] ?? null;
-}
 
 // ─── GET /api/repositories/:owner/:name/branch-protection ────────────────────
 
@@ -23,9 +14,11 @@ app.get("/api/repositories/:owner/:name/branch-protection", requireAuth, async (
   const name = c.req.param("name");
   const currentUser = c.get("user")!;
 
-  const repo = await getRepoByOwnerName(owner, name);
+  const repo = await resolveRepositoryWithAccess(owner, name, currentUser);
   if (!repo) return c.json({ error: "Repository not found" }, 404);
-  if (currentUser.id !== repo.ownerId) return c.json({ error: "Not authorized" }, 403);
+  if (!(await canManageRepository(repo, currentUser))) {
+    return c.json({ error: "Not authorized" }, 403);
+  }
 
   const rules = await db.query.branchProtectionRules.findMany({
     where: eq(branchProtectionRules.repositoryId, repo.id),
@@ -53,9 +46,11 @@ app.post("/api/repositories/:owner/:name/branch-protection", requireAuth, async 
 
   if (!body.pattern) return c.json({ error: "pattern is required" }, 400);
 
-  const repo = await getRepoByOwnerName(owner, name);
+  const repo = await resolveRepositoryWithAccess(owner, name, currentUser);
   if (!repo) return c.json({ error: "Repository not found" }, 404);
-  if (currentUser.id !== repo.ownerId) return c.json({ error: "Not authorized" }, 403);
+  if (!(await canManageRepository(repo, currentUser))) {
+    return c.json({ error: "Not authorized" }, 403);
+  }
 
   const [rule] = await db
     .insert(branchProtectionRules)
@@ -94,9 +89,11 @@ app.patch("/api/repositories/:owner/:name/branch-protection/:ruleId", requireAut
     allowDeletion?: boolean;
   }>();
 
-  const repo = await getRepoByOwnerName(owner, name);
+  const repo = await resolveRepositoryWithAccess(owner, name, currentUser);
   if (!repo) return c.json({ error: "Repository not found" }, 404);
-  if (currentUser.id !== repo.ownerId) return c.json({ error: "Not authorized" }, 403);
+  if (!(await canManageRepository(repo, currentUser))) {
+    return c.json({ error: "Not authorized" }, 403);
+  }
 
   const existing = await db.query.branchProtectionRules.findFirst({
     where: and(eq(branchProtectionRules.id, ruleId), eq(branchProtectionRules.repositoryId, repo.id)),
@@ -126,9 +123,11 @@ app.delete("/api/repositories/:owner/:name/branch-protection/:ruleId", requireAu
   const ruleId = c.req.param("ruleId");
   const currentUser = c.get("user")!;
 
-  const repo = await getRepoByOwnerName(owner, name);
+  const repo = await resolveRepositoryWithAccess(owner, name, currentUser);
   if (!repo) return c.json({ error: "Repository not found" }, 404);
-  if (currentUser.id !== repo.ownerId) return c.json({ error: "Not authorized" }, 403);
+  if (!(await canManageRepository(repo, currentUser))) {
+    return c.json({ error: "Not authorized" }, 403);
+  }
 
   await db
     .delete(branchProtectionRules)

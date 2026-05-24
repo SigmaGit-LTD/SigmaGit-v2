@@ -11,34 +11,13 @@ import {
 import { eq, sql, and, desc, isNull, inArray } from "drizzle-orm";
 import { authMiddleware, requireAuth, type AuthVariables } from "../middleware/auth";
 import { parseLimit, parseOffset } from "../lib/validation";
-import { canAccessRepository } from "../lib/access";
+import { canManageRepository } from "../lib/access";
+import { resolveRepositoryWithAccess } from "../lib/repo-helpers";
 
 const app = new Hono<{ Variables: AuthVariables }>();
 
 
 const VALID_EMOJIS = ["+1", "-1", "laugh", "hooray", "confused", "heart", "rocket", "eyes"];
-
-async function getRepoAndCheckAccess(owner: string, name: string, user?: { id: string; role?: string } | null) {
-  const result = await db
-    .select({
-      id: repositories.id,
-      ownerId: repositories.ownerId,
-      visibility: repositories.visibility,
-    })
-    .from(repositories)
-    .innerJoin(users, eq(users.id, repositories.ownerId))
-    .where(and(eq(users.username, owner), eq(repositories.name, name)))
-    .limit(1);
-
-  const row = result[0];
-  if (!row) return null;
-
-  if (!(await canAccessRepository(row, user))) {
-    return null;
-  }
-
-  return { repoId: row.id, ownerId: row.ownerId };
-}
 
 async function getDiscussionReactionsGrouped(discussionId: string, userId?: string) {
   const counts = await db
@@ -237,12 +216,12 @@ app.get("/api/repositories/:owner/:name/discussions", async (c) => {
   const limit = parseLimit(c.req.query("limit"), 20, 50);
   const offset = parseOffset(c.req.query("offset"), 0);
 
-  const repoAccess = await getRepoAndCheckAccess(owner, name, currentUser);
+  const repoAccess = await resolveRepositoryWithAccess(owner, name, currentUser);
   if (!repoAccess) {
     return c.json({ error: "Repository not found" }, 404);
   }
 
-  const conditions = [eq(discussions.repositoryId, repoAccess.repoId)];
+  const conditions = [eq(discussions.repositoryId, repoAccess.id)];
   if (categoryFilter) {
     conditions.push(eq(discussions.categoryId, categoryFilter));
   }
@@ -267,7 +246,7 @@ app.get("/api/repositories/:owner/:name/discussions/categories", async (c) => {
   const name = c.req.param("name");
   const currentUser = c.get("user");
 
-  const repoAccess = await getRepoAndCheckAccess(owner, name, currentUser);
+  const repoAccess = await resolveRepositoryWithAccess(owner, name, currentUser);
   if (!repoAccess) {
     return c.json({ error: "Repository not found" }, 404);
   }
@@ -275,7 +254,7 @@ app.get("/api/repositories/:owner/:name/discussions/categories", async (c) => {
   const categories = await db
     .select()
     .from(discussionCategories)
-    .where(eq(discussionCategories.repositoryId, repoAccess.repoId))
+    .where(eq(discussionCategories.repositoryId, repoAccess.id))
     .orderBy(discussionCategories.name);
 
   return c.json({ categories });
@@ -287,12 +266,12 @@ app.post("/api/repositories/:owner/:name/discussions/categories", requireAuth, a
   const user = c.get("user")!;
   const body = await c.req.json<{ name: string; emoji?: string; description?: string }>();
 
-  const repoAccess = await getRepoAndCheckAccess(owner, name, user);
+  const repoAccess = await resolveRepositoryWithAccess(owner, name, user);
   if (!repoAccess) {
     return c.json({ error: "Repository not found" }, 404);
   }
 
-  if (user.id !== repoAccess.ownerId) {
+  if (!(await canManageRepository(repoAccess, user))) {
     return c.json({ error: "Only repo owner can create categories" }, 403);
   }
 
@@ -303,7 +282,7 @@ app.post("/api/repositories/:owner/:name/discussions/categories", requireAuth, a
   const [inserted] = await db
     .insert(discussionCategories)
     .values({
-      repositoryId: repoAccess.repoId,
+      repositoryId: repoAccess.id,
       name: body.name,
       emoji: body.emoji,
       description: body.description,
@@ -319,13 +298,13 @@ app.get("/api/repositories/:owner/:name/discussions/:number", async (c) => {
   const number = parseInt(c.req.param("number"), 10);
   const currentUser = c.get("user");
 
-  const repoAccess = await getRepoAndCheckAccess(owner, name, currentUser);
+  const repoAccess = await resolveRepositoryWithAccess(owner, name, currentUser);
   if (!repoAccess) {
     return c.json({ error: "Repository not found" }, 404);
   }
 
   const discussion = await db.query.discussions.findFirst({
-    where: and(eq(discussions.repositoryId, repoAccess.repoId), eq(discussions.number, number)),
+    where: and(eq(discussions.repositoryId, repoAccess.id), eq(discussions.number, number)),
   });
 
   if (!discussion) {
@@ -342,7 +321,7 @@ app.post("/api/repositories/:owner/:name/discussions", requireAuth, async (c) =>
   const user = c.get("user")!;
   const body = await c.req.json<{ title: string; body: string; categoryId?: string }>();
 
-  const repoAccess = await getRepoAndCheckAccess(owner, name, user);
+  const repoAccess = await resolveRepositoryWithAccess(owner, name, user);
   if (!repoAccess) {
     return c.json({ error: "Repository not found" }, 404);
   }
@@ -358,12 +337,12 @@ app.post("/api/repositories/:owner/:name/discussions", requireAuth, async (c) =>
   const [maxNumber] = await db
     .select({ max: sql<number>`COALESCE(MAX(number), 0)` })
     .from(discussions)
-    .where(eq(discussions.repositoryId, repoAccess.repoId));
+    .where(eq(discussions.repositoryId, repoAccess.id));
 
   const [inserted] = await db
     .insert(discussions)
     .values({
-      repositoryId: repoAccess.repoId,
+      repositoryId: repoAccess.id,
       authorId: user.id,
       title: body.title,
       body: body.body,

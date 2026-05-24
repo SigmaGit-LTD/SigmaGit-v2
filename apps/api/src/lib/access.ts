@@ -137,3 +137,25 @@ export async function canAccessRepository(
 
   return false;
 }
+
+/**
+ * Check if a user can manage repository settings (branch protection, webhooks, collaborators, etc.).
+ *
+ * - Repo owner always qualifies
+ * - Org owners/admins qualify for org repos
+ * - Admin collaborators qualify
+ */
+export async function canManageRepository(
+  repo: Repository,
+  user: { id: string }
+): Promise<boolean> {
+  if (user.id === repo.ownerId) return true;
+
+  if (repo.organizationId) {
+    const role = await getOrgMemberRole(repo.organizationId, user.id);
+    if (role === 'owner' || role === 'admin') return true;
+  }
+
+  const permission = await getCollaboratorPermission(repo.id, user.id);
+  return permission === 'admin';
+}

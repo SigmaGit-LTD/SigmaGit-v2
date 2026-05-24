@@ -1,24 +1,11 @@
 import { Hono } from "hono";
-import { db, users, repositories, repositoryCollaborators } from "@sigmagit/db";
+import { db, users, repositoryCollaborators } from "@sigmagit/db";
 import { eq, and } from "drizzle-orm";
 import { authMiddleware, requireAuth, type AuthVariables } from "../middleware/auth";
-import { canAccessRepository } from "../lib/access";
+import { canManageRepository } from "../lib/access";
+import { resolveRepositoryWithAccess } from "../lib/repo-helpers";
 
 const app = new Hono<{ Variables: AuthVariables }>();
-
-
-// ─── Helper: check if user is repo owner or admin collaborator ───────────────
-
-async function canManageCollaborators(repoId: string, userId: string, ownerId: string): Promise<boolean> {
-  if (userId === ownerId) return true;
-  const collab = await db.query.repositoryCollaborators.findFirst({
-    where: and(
-      eq(repositoryCollaborators.repositoryId, repoId),
-      eq(repositoryCollaborators.userId, userId)
-    ),
-  });
-  return collab?.permission === "admin";
-}
 
 // ─── GET /api/repositories/:owner/:name/collaborators ────────────────────────
 
@@ -27,24 +14,8 @@ app.get("/api/repositories/:owner/:name/collaborators", async (c) => {
   const name = c.req.param("name");
   const currentUser = c.get("user");
 
-  const result = await db
-    .select({
-      id: repositories.id,
-      ownerId: repositories.ownerId,
-      visibility: repositories.visibility,
-      ownerUsername: users.username,
-    })
-    .from(repositories)
-    .innerJoin(users, eq(users.id, repositories.ownerId))
-    .where(and(eq(users.username, owner), eq(repositories.name, name)))
-    .limit(1);
-
-  const repo = result[0];
+  const repo = await resolveRepositoryWithAccess(owner, name, currentUser);
   if (!repo) return c.json({ error: "Repository not found" }, 404);
-
-  if (!(await canAccessRepository(repo, currentUser))) {
-    return c.json({ error: "Repository not found" }, 404);
-  }
 
   const collabs = await db
     .select({
@@ -78,17 +49,10 @@ app.post("/api/repositories/:owner/:name/collaborators", requireAuth, async (c) 
 
   if (!body.username) return c.json({ error: "username is required" }, 400);
 
-  const result = await db
-    .select({ id: repositories.id, ownerId: repositories.ownerId })
-    .from(repositories)
-    .innerJoin(users, eq(users.id, repositories.ownerId))
-    .where(and(eq(users.username, owner), eq(repositories.name, name)))
-    .limit(1);
-
-  const repo = result[0];
+  const repo = await resolveRepositoryWithAccess(owner, name, currentUser);
   if (!repo) return c.json({ error: "Repository not found" }, 404);
 
-  const canManage = await canManageCollaborators(repo.id, currentUser.id, repo.ownerId);
+  const canManage = await canManageRepository(repo, currentUser);
   if (!canManage) return c.json({ error: "Not authorized" }, 403);
 
   const targetUser = await db.query.users.findFirst({
@@ -132,17 +96,10 @@ app.patch("/api/repositories/:owner/:name/collaborators/:userId", requireAuth, a
 
   if (!body.permission) return c.json({ error: "permission is required" }, 400);
 
-  const result = await db
-    .select({ id: repositories.id, ownerId: repositories.ownerId })
-    .from(repositories)
-    .innerJoin(users, eq(users.id, repositories.ownerId))
-    .where(and(eq(users.username, owner), eq(repositories.name, name)))
-    .limit(1);
-
-  const repo = result[0];
+  const repo = await resolveRepositoryWithAccess(owner, name, currentUser);
   if (!repo) return c.json({ error: "Repository not found" }, 404);
 
-  const canManage = await canManageCollaborators(repo.id, currentUser.id, repo.ownerId);
+  const canManage = await canManageRepository(repo, currentUser);
   if (!canManage) return c.json({ error: "Not authorized" }, 403);
 
   await db
@@ -166,17 +123,10 @@ app.delete("/api/repositories/:owner/:name/collaborators/:userId", requireAuth, 
   const targetUserId = c.req.param("userId");
   const currentUser = c.get("user")!;
 
-  const result = await db
-    .select({ id: repositories.id, ownerId: repositories.ownerId })
-    .from(repositories)
-    .innerJoin(users, eq(users.id, repositories.ownerId))
-    .where(and(eq(users.username, owner), eq(repositories.name, name)))
-    .limit(1);
-
-  const repo = result[0];
+  const repo = await resolveRepositoryWithAccess(owner, name, currentUser);
   if (!repo) return c.json({ error: "Repository not found" }, 404);
 
-  const canManage = await canManageCollaborators(repo.id, currentUser.id, repo.ownerId);
+  const canManage = await canManageRepository(repo, currentUser);
   if (!canManage && currentUser.id !== targetUserId) {
     return c.json({ error: "Not authorized" }, 403);
   }
